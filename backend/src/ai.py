@@ -16,11 +16,13 @@ from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.ollama import OllamaModel
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.profiles.anthropic import AnthropicModelProfile
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.ollama import OllamaProvider
+from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 
@@ -441,7 +443,7 @@ def build_transcript_system_prompt(clip_length: str = "auto") -> str:
 _transcript_agent: Optional[Agent[None, TranscriptAnalysis]] = None
 _transcript_agent_signature: Optional[tuple[str | None, ...]] = None
 
-SUPPORTED_LLM_PROVIDERS = {"google", "google-gla", "openai", "openrouter", "anthropic", "ollama"}
+SUPPORTED_LLM_PROVIDERS = {"google", "google-gla", "openai", "openrouter", "anthropic", "ollama", "bedrock"}
 
 
 def _split_llm_name(model_name: str) -> tuple[str, str | None]:
@@ -491,6 +493,14 @@ def _get_missing_llm_key_error(model_name: str, runtime_config: Config) -> Optio
             "Selected LLM provider is Anthropic, but ANTHROPIC_API_KEY is not set. "
             "Set ANTHROPIC_API_KEY or choose another provider with a matching API key."
         )
+
+    if provider == "bedrock":
+        if not runtime_config.bedrock_api_key:
+            return (
+                "Selected LLM provider is AWS Bedrock, but AWS_BEARER_TOKEN_BEDROCK is not set. "
+                "Generate a Bedrock API key from the AWS Console under Amazon Bedrock > API Keys."
+            )
+        return None
 
     if provider == "ollama":
         # Ollama can run locally without an API key. OLLAMA_BASE_URL/OLLAMA_API_KEY
@@ -550,6 +560,29 @@ def _build_transcript_model(
                 "max_tokens": 8192,
             },
         )
+
+    # ---- AWS Bedrock via OpenAI-compatible endpoint (Bearer token) ----
+    if provider == "bedrock":
+        if not provider_model_name:
+            raise RuntimeError(
+                "Bedrock provider requires a model ID. "
+                "Use format bedrock:<model-id>, e.g. bedrock:in.moonshotai.kimi-k3.1"
+            )
+        from pydantic_ai.models.openai import OpenAIChatModel
+        from pydantic_ai.providers.openai import OpenAIProvider
+
+        region = getattr(runtime_config, "aws_region", None) or "ap-south-1"
+        bedrock_base_url = f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1"
+
+        bedrock_provider = OpenAIProvider(
+            base_url=bedrock_base_url,
+            api_key=runtime_config.bedrock_api_key,
+        )
+        return OpenAIChatModel(
+            model_name=provider_model_name,
+            provider=bedrock_provider,
+        )
+
     if provider != "ollama":
         return model_name
 
@@ -566,8 +599,6 @@ def _build_transcript_model(
             api_key=runtime_config.ollama_api_key,
         ),
     )
-
-
 def get_transcript_agent(clip_length: str = "auto") -> Agent[None, TranscriptAnalysis]:
     """Get or create the transcript analysis agent (lazy initialization)."""
     global _transcript_agent, _transcript_agent_signature

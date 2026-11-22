@@ -22,6 +22,14 @@ class Config:
         self.ollama_base_url = self._get_runtime_setting("OLLAMA_BASE_URL")
         self.ollama_api_key = self._get_runtime_setting("OLLAMA_API_KEY")
 
+        # AWS Bedrock support — single bearer token (AWS_BEARER_TOKEN_BEDROCK)
+        # Region still needed for the endpoint URL
+        self.aws_region = os.getenv("AWS_REGION", "ap-south-1").strip()
+        self.bedrock_api_key = os.getenv("AWS_BEARER_TOKEN_BEDROCK", "").strip()
+        # Keep these for SES email sending (unrelated to Bedrock LLM)
+        self.aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
+        self.aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
+
         self.whisper_model = os.getenv("WHISPER_MODEL") or os.getenv("WHISPER_MODEL_SIZE", "base")
         self.transcription_provider = self._normalize_transcription_provider(
             os.getenv("TRANSCRIPTION_PROVIDER", "assemblyai")

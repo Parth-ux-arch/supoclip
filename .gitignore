@@ -7,6 +7,7 @@ __pycache__
 logs/
 temp/
 .env
+cookies.txt
 *.m4a
 frontend/e2e/.seed.json
 frontend/playwright-report/

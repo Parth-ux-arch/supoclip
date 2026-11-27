@@ -42,6 +42,7 @@ from .ffmpeg import (
 from .transcription import (
     load_cached_transcript_data,
 )
+from .hinglish import romanize_hindi
 from .timeline import (
     get_absolute_words_in_range,
     get_words_for_keep_ranges,
@@ -716,6 +717,13 @@ def build_assemblyai_ass_subtitles(
         return False
     if censor_spans:
         relevant_words = censored_words(relevant_words, censor_spans)
+    # Existing transcript caches and editor-supplied words may predate the
+    # Latin-script display cache. Keep timing and source data untouched.
+    relevant_words = [
+        {**word, "text": romanize_hindi(str(word.get("text", "")))}
+        for word in relevant_words
+    ]
+    hook_title = romanize_hindi(hook_title) if hook_title else hook_title
 
     effective_font_family, template = ensure_glyph_coverage(
         effective_font_family,

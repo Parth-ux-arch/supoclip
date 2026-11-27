@@ -185,6 +185,29 @@ def test_build_assemblyai_ass_subtitles_uses_cached_word_timings(tmp_path):
     assert "Dialogue:" in content
 
 
+def test_cached_hindi_words_render_as_hinglish_without_changing_cache(tmp_path):
+    video_path = tmp_path / "source.mp4"
+    cache_path = video_path.with_suffix(".transcript_cache.json")
+    cache_path.write_text(
+        '{"version": 2, "words": [{"text": "मुझे", "start": 0, "end": 400}, '
+        '{"text": "नहीं", "start": 400, "end": 800}], "utterances": [], '
+        '"text": "मुझे नहीं", "language_code": "hi"}',
+        encoding="utf-8",
+    )
+    ass_path = tmp_path / "captions.ass"
+    assert video_utils.build_assemblyai_ass_subtitles(
+        video_path, 0.0, 0.8, 1080, 1920, ass_path,
+        caption_template="default", keep_ranges=[(0.0, 0.8)],
+    )
+    rendered = ass_path.read_text(encoding="utf-8")
+    assert "mujhe" in rendered and "nahi" in rendered
+    assert "मुझे" not in rendered and "नहीं" not in rendered
+    assert "मुझे" in cache_path.read_text(encoding="utf-8")
+    loaded = video_utils.load_cached_transcript_data(video_path)
+    assert [word["text"] for word in loaded["words"]] == ["mujhe", "nahi"]
+    assert [word["source_text"] for word in loaded["words"]] == ["मुझे", "नहीं"]
+
+
 def test_ass_font_name_uses_internal_font_family():
     assert video_utils.ass_font_name("THEBOLDFONT") == "THE BOLD FONT FREE VERSION"
 

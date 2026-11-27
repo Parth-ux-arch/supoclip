@@ -263,9 +263,9 @@ class Config:
                 "http://sp.localhost:3107",
             ],
         )
-        self.aws_region = self._get_optional_env("AWS_REGION")
-        self.aws_access_key_id = self._get_optional_env("AWS_ACCESS_KEY_ID")
-        self.aws_secret_access_key = self._get_optional_env("AWS_SECRET_ACCESS_KEY")
+        self.email_provider = os.getenv("EMAIL_PROVIDER", "ses").strip().lower()
+        self.resend_api_key = self._get_optional_env("RESEND_API_KEY")
+        self.resend_from_email = self._get_optional_env("RESEND_FROM_EMAIL")
         self.ses_from_email = os.getenv(
             "SES_FROM_EMAIL", "SupoClip <onboarding@example.com>"
         )

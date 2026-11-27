@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import re
 import secrets
 import shutil
@@ -415,6 +416,9 @@ def base_proxy_params(task_id: Optional[str] = None, video_id: Optional[str] = N
         # yt-dlp needs a JS runtime for YouTube's player challenge. Prefer the
         # deno binary installed in the image; do not pin a player client.
         params["js_runtimes"] = {"deno": {}}
+    cookie_path = os.getenv("YOUTUBE_COOKIES_PATH", "/app/cookies.txt")
+    if os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 0:
+        params["cookiefile"] = cookie_path
     return params
 
 

@@ -172,17 +172,17 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def test_prompts_without_instructions_are_byte_identical_to_before_workflows():
-    # Hashes of the prompts as built before instructions existed (invariant I1).
+def test_prompts_without_instructions_match_current_contract():
+    # Snapshot the intentional selection and title instructions.
     assert _sha(build_transcript_analysis_prompt(transcript=GOLDEN_TRANSCRIPT)) == (
-        "5bb0569392010fae1b4649912ce1f22e15bb5a39f3d26d7abe52b871f51d43cb"
+        "f55276dadd37765f1d3c2a96ad740b2b4023a8294d098998aecba5a5dfc7e54d"
     )
     assert _sha(
         build_transcript_analysis_prompt(
             transcript=GOLDEN_TRANSCRIPT, clip_signals="- [00:03 - 00:05] laugh", window=(0, 720),
             performance_context="hook_type question wins", clip_length="short", instructions=None,
         )
-    ) == "f4aed4bf309e08ed8beeb6a111793d4ec5f55aeb1644349758fddfc5f96eb337"
+    ) == "b9f7cc46f17d56c4c586206c3593a6f8a29bbb10bce52dd734667d300f696f1b"
     assert _sha(build_candidate_rerank_prompt(_golden_candidates())) == (
         "dbc69a7497e6093a8590e8abb3d92a81de31131534c70eb7a269f792c9194a8c"
     )

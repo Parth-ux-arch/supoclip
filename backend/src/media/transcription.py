@@ -281,6 +281,9 @@ def transcribe_with_youtube_captions(video_url: str) -> Optional[str]:
             "skip_download": True,
             "outtmpl": str(temp_dir / video_id),
         }
+        cookie_path = os.getenv("YOUTUBE_COOKIES_PATH", "/app/cookies.txt")
+        if os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 0:
+            ydl_opts["cookiefile"] = cookie_path
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
 
@@ -515,6 +518,21 @@ def load_cached_transcript_data(video_path: Path) -> Optional[Dict]:
             if "version" not in payload:
                 payload["version"] = TRANSCRIPT_CACHE_SCHEMA_VERSION
                 payload.setdefault("utterances", [])
+            from .hinglish import romanize_hindi
+
+            for word in payload.get("words", []):
+                original = str(word.get("source_text") or word.get("text", ""))
+                display = romanize_hindi(original)
+                if display != original:
+                    word["source_text"] = original
+                    word["text"] = display
+            for utterance in payload.get("utterances", []):
+                for word in utterance.get("words", []):
+                    original = str(word.get("source_text") or word.get("text", ""))
+                    display = romanize_hindi(original)
+                    if display != original:
+                        word["source_text"] = original
+                        word["text"] = display
             return payload
     except Exception as e:
         logger.warning(f"Failed to load transcript cache: {e}")

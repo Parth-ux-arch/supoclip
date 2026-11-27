@@ -30,6 +30,7 @@ from .config import Config, get_config
 from .clip_duration import clip_duration
 from .runtime_settings import apply_settings_to_process_env
 from .workflows.prompts import instructions_block
+from .media.hinglish import romanize_hindi
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +333,7 @@ WHAT A GOOD CLIP FEELS LIKE:
 - Expand a great short moment to nearby contiguous lines when that adds needed setup, stakes, or payoff
 - Strong picks include contrarian claims, mistakes or lessons, concrete examples, before/after moments, frameworks, surprising results, emotionally charged reactions, and complete answers to interesting questions
 - Bad picks include intros, sponsor or CTA sections, vague setup, contextless quote fragments, repeated points, definitions without payoff, meandering background, and answer fragments that require unseen context
+- When several candidates cover the same idea, keep the one with the clearest opening and payoff; do not fill the target count with weaker duplicates
 
 VIRALITY SCORING (0-100 total, from four 0-25 subscores):
 For each segment, provide a detailed virality breakdown:
@@ -368,7 +370,7 @@ HOOK TITLES ("hook_title" per segment):
 - Plain text only: no hashtags, no emojis, no quotes around the title
 - Sentence case: capitalise only the first word, names and acronyms, never Every Word
 - Keep the sign on a number exactly as it was said: 90%, $40k, £4,000
-- Write it in the same language as the transcript
+- Write Hindi or Hinglish titles in natural Latin-script Hinglish, preserving English words. Write English titles in English. Never use Devanagari in hook titles.
 - Good examples: "The $40k mistake I keep seeing", "Why nobody tells you this about VC", "Do this before your next interview"
 
 CLIP BOUNDARIES — OPENING AND ENDING:
@@ -612,6 +614,8 @@ def get_transcript_agent(clip_length: str = "auto") -> Agent[None, TranscriptAna
         runtime_config.openrouter_fallback_model,
         runtime_config.google_api_key,
         runtime_config.anthropic_api_key,
+        getattr(runtime_config, "bedrock_api_key", None),
+        getattr(runtime_config, "aws_region", None),
         runtime_config.ollama_base_url,
         runtime_config.ollama_api_key,
     )
@@ -692,6 +696,8 @@ def get_rerank_agent() -> Agent[None, CandidateRanking]:
         runtime_config.openrouter_fallback_model,
         runtime_config.google_api_key,
         runtime_config.anthropic_api_key,
+        getattr(runtime_config, "bedrock_api_key", None),
+        getattr(runtime_config, "aws_region", None),
         runtime_config.ollama_base_url,
         runtime_config.ollama_api_key,
     )
@@ -767,6 +773,8 @@ def get_broll_agent() -> Agent[None, BRollPlan]:
         runtime_config.openrouter_fallback_model,
         runtime_config.google_api_key,
         runtime_config.anthropic_api_key,
+        getattr(runtime_config, "bedrock_api_key", None),
+        getattr(runtime_config, "aws_region", None),
         runtime_config.ollama_base_url,
         runtime_config.ollama_api_key,
     )
@@ -906,6 +914,7 @@ Follow this workflow:
 
 Selection target:
 - Choose {segment_target} segments total.
+- Return fewer segments when the transcript lacks enough distinct, self-contained moments; the target is not a quota.
 - Most selected clips should be {bounds.ideal_minimum}-{bounds.ideal_maximum} seconds.
 - Every clip must contain a full setup and payoff within {bounds.minimum}-{bounds.maximum} seconds.
 - If a strong moment is shorter than {bounds.ideal_minimum} seconds, first try expanding to nearby contiguous transcript lines that add useful context.
@@ -928,7 +937,7 @@ JSON-only output requirements:
 - Top-level keys: "most_relevant_segments", "summary", "key_topics".
 - Segment keys: "start_time", "end_time", "text", "relevance_score", "reasoning", "virality", "hook_title".
 - Optional segment keys "hook_start_time"/"hook_end_time": null unless a later 2-5 second line stands alone and the real opening is already a complete setup. The clip is not replayed from that line by default.
-- "hook_title" is a 3-9 word plain-text headline for the clip, in the transcript's language, grounded in the segment (no hashtags, emojis, or quotes).
+- "hook_title" is a 3-9 word plain-text headline grounded in the segment. Use Latin-script Hinglish for Hindi or Hinglish speech, English for English speech (no hashtags, emojis, or quotes).
 - Virality keys: "hook_score", "engagement_score", "value_score", "shareability_score", "total_score", "hook_type", "virality_reasoning".
 - Do not return segments shorter than {bounds.minimum} seconds or longer than {bounds.maximum} seconds.
 
@@ -1068,7 +1077,7 @@ def sanitize_hook_title(raw: Optional[str], source_text: Optional[str] = None) -
         title = (clipped[:cut] if cut > 20 else title[:HOOK_TITLE_MAX_CHARS]).rstrip(
             ".,;:-–— "
         )
-    return title or None
+    return romanize_hindi(title) or None
 
 
 def _sanitize_hook_span(

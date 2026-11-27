@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from dataclasses import dataclass, replace
 from email import policy
@@ -8,6 +9,7 @@ from email.message import EmailMessage
 from typing import Optional
 
 import boto3
+import requests
 
 from ..config import Config
 from ..database import get_session_maker
@@ -52,10 +54,20 @@ class SesEmailService:
         self.access_key_id = self.config.aws_access_key_id
         self.secret_access_key = self.config.aws_secret_access_key
         self.from_email = self.config.ses_from_email
+        # Keep the existing class name for callers; SES remains the default.
+        self.provider = getattr(self.config, "email_provider", "ses")
+        self.resend_api_key = getattr(self.config, "resend_api_key", None)
+        if self.provider == "resend":
+            self.region = "resend"
+            self.from_email = getattr(self.config, "resend_from_email", None)
         self._client = None
 
     @property
     def is_configured(self) -> bool:
+        if self.provider == "resend":
+            return bool(self.resend_api_key and self.from_email)
+        if self.provider != "ses":
+            return False
         return bool(
             self.region
             and self.access_key_id
@@ -91,7 +103,44 @@ class SesEmailService:
             )
         return message.as_bytes(policy=policy.SMTP)
 
+    def _send_resend(self, recipient: str, content: EmailContent) -> dict:
+        payload = {
+            "from": self.from_email, "to": [recipient],
+            "subject": content.subject, "html": content.html, "text": content.text,
+        }
+        if content.headers:
+            payload["headers"] = dict(content.headers)
+        if content.reply_to:
+            payload["reply_to"] = list(content.reply_to)
+        if content.inline_images:
+            payload["attachments"] = [
+                {"filename": f"image-{index}.{image.content_type.split('/')[-1]}",
+                 "content": base64.b64encode(image.data).decode("ascii"),
+                 "content_type": image.content_type, "content_id": image.content_id}
+                for index, image in enumerate(content.inline_images)
+            ]
+        try:
+            response = requests.post(
+                "https://api.resend.com/emails", json=payload,
+                headers={"Authorization": f"Bearer {self.resend_api_key}"},
+                timeout=(5, 30), allow_redirects=False,
+            )
+        except requests.RequestException:
+            # Do not include response/request bodies containing verification links.
+            raise ValueError("Resend email request failed; delivery is unconfirmed") from None
+        if not 200 <= response.status_code < 300:
+            raise ValueError(f"Resend rejected email (HTTP {response.status_code})")
+        try:
+            message_id = response.json().get("id")
+        except (ValueError, AttributeError):
+            message_id = None
+        if not isinstance(message_id, str) or not message_id:
+            raise ValueError("Resend response did not include a message ID")
+        return {"MessageId": message_id}
+
     def _send(self, recipient: str, content: EmailContent) -> dict:
+        if self.provider == "resend":
+            return self._send_resend(recipient, content)
         headers = [{"Name": name, "Value": value} for name, value in content.headers]
         # boto3 clients are thread-safe; reuse one across a campaign's sends.
         if self._client is None:
@@ -125,6 +174,10 @@ class SesEmailService:
 
     async def send_email(self, recipient: str, content: EmailContent) -> dict:
         if not self.is_configured:
+            if self.provider == "resend":
+                raise RuntimeError("Resend is not configured. Set RESEND_API_KEY and RESEND_FROM_EMAIL.")
+            if self.provider != "ses":
+                raise RuntimeError("Unsupported EMAIL_PROVIDER; use ses or resend.")
             raise RuntimeError(
                 "Amazon SES is not configured. Set AWS_REGION, AWS_ACCESS_KEY_ID, "
                 "AWS_SECRET_ACCESS_KEY and SES_FROM_EMAIL."
@@ -141,7 +194,7 @@ class SesEmailService:
             )
 
         response = await asyncio.to_thread(self._send, recipient, content)
-        # This is acceptance by SES, not proof of inbox delivery. Record only
+        # This is acceptance by the email provider, not proof of inbox delivery. Record only
         # metadata: bodies can contain password reset or verification tokens.
         message_id = response["MessageId"]
         try:
@@ -154,10 +207,10 @@ class SesEmailService:
                 ))
                 await db.commit()
         except Exception:
-            # SES has already accepted the message. Preserve a correlation
+            # The email provider has already accepted the message. Preserve a correlation
             # fallback without making callers retry and send duplicate emails.
             logger.exception(
-                "SES audit persistence failed: message_id=%s recipient=%s region=%s subject=%r",
+                "Email audit persistence failed: message_id=%s recipient=%s region=%s subject=%r",
                 message_id, recipient, self.region, content.subject,
             )
         return dict(response)

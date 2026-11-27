@@ -31,7 +31,7 @@ services:
     ports:
       # Keep the legacy port for deployments whose proxy already uses 3001.
       # .env.example selects 3107 for new self-hosted installations.
-      - "127.0.0.1:${FRONTEND_PORT:-3001}:3107"
+      - "${FRONTEND_PORT:-3107}:3107"
     volumes:
       - ./frontend/src:/app/src
       - ./frontend/public:/app/public
@@ -116,6 +116,9 @@ services:
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_BEARER_TOKEN_BEDROCK=${AWS_BEARER_TOKEN_BEDROCK}
       - "SES_FROM_EMAIL=${SES_FROM_EMAIL:-SupoClip <onboarding@example.com>}"
+      - EMAIL_PROVIDER=${EMAIL_PROVIDER:-ses}
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - RESEND_FROM_EMAIL=${RESEND_FROM_EMAIL:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -143,7 +146,7 @@ services:
     platform: "${BACKEND_PLATFORM:-linux/amd64}"
     command: [".venv/bin/uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
-      - "127.0.0.1:8000:8000"
+      - "${BACKEND_PORT:-8000}:8000"
     volumes:
       - ./backend/src:/app/src
       - uploads:/app/uploads
@@ -152,6 +155,7 @@ services:
       - ./backend/transitions:/app/transitions
       # Drop-in SFX and music beds (FX_LIBRARY_DIR); every render machine mounts the same library.
       - ./backend/fx_library:/app/fx_library
+      - ./cookies.txt:/app/cookies.txt
     environment:
       - PYTHONPATH=/app
       - PYTHONUNBUFFERED=1
@@ -272,6 +276,9 @@ services:
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_BEARER_TOKEN_BEDROCK=${AWS_BEARER_TOKEN_BEDROCK}
       - "SES_FROM_EMAIL=${SES_FROM_EMAIL:-SupoClip <onboarding@example.com>}"
+      - EMAIL_PROVIDER=${EMAIL_PROVIDER:-ses}
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - RESEND_FROM_EMAIL=${RESEND_FROM_EMAIL:-}
       - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3107}
       - DISCORD_FEEDBACK_WEBHOOK_URL=${DISCORD_FEEDBACK_WEBHOOK_URL}
       # Hermes assistant route for every feedback submission (docs/feedback.md)
@@ -384,6 +391,7 @@ services:
       - ./backend/transitions:/app/transitions
       # Drop-in SFX and music beds (FX_LIBRARY_DIR); every render machine mounts the same library.
       - ./backend/fx_library:/app/fx_library
+      - ./cookies.txt:/app/cookies.txt
     environment: &worker-environment
       - PYTHONPATH=/app
       - PYTHONUNBUFFERED=1
@@ -508,6 +516,9 @@ services:
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_BEARER_TOKEN_BEDROCK=${AWS_BEARER_TOKEN_BEDROCK}
       - "SES_FROM_EMAIL=${SES_FROM_EMAIL:-SupoClip <onboarding@example.com>}"
+      - EMAIL_PROVIDER=${EMAIL_PROVIDER:-ses}
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - RESEND_FROM_EMAIL=${RESEND_FROM_EMAIL:-}
       - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3107}
       # Social publishing (OAuth apps; users connect their own accounts)
       - YOUTUBE_OAUTH_CLIENT_ID=${YOUTUBE_OAUTH_CLIENT_ID}
@@ -565,8 +576,8 @@ services:
     healthcheck:
       test: ["CMD", ".venv/bin/arq", "--check", "src.workers.tasks.WorkerSettings"]
       interval: 30s
-      timeout: 10s
-      retries: 3
+      timeout: 25s
+      retries: 5
       start_period: 60s
 
   # Optional split of the cron process. Not started by a normal `up`.
@@ -592,6 +603,7 @@ services:
       - ./backend/transitions:/app/transitions
       # Drop-in SFX and music beds (FX_LIBRARY_DIR); every render machine mounts the same library.
       - ./backend/fx_library:/app/fx_library
+      - ./cookies.txt:/app/cookies.txt
     environment: *worker-environment
     restart: unless-stopped
     depends_on:
@@ -631,8 +643,8 @@ services:
     healthcheck:
       test: ["CMD", ".venv/bin/arq", "--check", "src.workers.ai_worker.AIWorkerSettings"]
       interval: 30s
-      timeout: 10s
-      retries: 3
+      timeout: 25s
+      retries: 5
       start_period: 60s
 
   # PO token helper for yt-dlp. Opt-in: COMPOSE_PROFILES=youtube-proxy

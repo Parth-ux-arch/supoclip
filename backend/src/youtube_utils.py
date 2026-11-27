@@ -11,6 +11,7 @@ import json
 import uuid
 import re
 import time
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
@@ -106,8 +107,18 @@ class YouTubeDownloader:
             "prefer_insecure": False,
             "age_limit": None,
         }
+        cookie_file = get_cookiefile()
+        if cookie_file:
+            opts["cookiefile"] = cookie_file
 
         return opts
+
+
+def get_cookiefile() -> Optional[str]:
+    cookie_path = os.getenv("YOUTUBE_COOKIES_PATH", "/app/cookies.txt")
+    if os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 0:
+        return cookie_path
+    return None
 
 
 def _build_info_options(task_id: Optional[str] = None) -> Dict[str, Any]:
@@ -128,6 +139,9 @@ def _build_info_options(task_id: Optional[str] = None) -> Dict[str, Any]:
         },
         "nocheckcertificate": True,
     }
+    cookie_file = get_cookiefile()
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
     if proxy_configured():
         # Metadata must leave through the same proxy as the media, or YouTube
         # bot-checks the server IP before a download starts. No player client

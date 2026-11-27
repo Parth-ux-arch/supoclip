@@ -97,6 +97,18 @@
       "title": "Self-host SupoClip with Docker Compose",
       "description": "Requirements, environment variables, first boot, a fully local setup, and production checks."
     },
+    "blog_supoclip_vs_opusclip_klap_vizard": {
+      "eyebrow": "Comparison",
+      "title": "SupoClip vs OpusClip vs Klap vs Vizard",
+      "label": "SupoClip vs OpusClip, Klap, Vizard",
+      "description": "Free plans, price per hour or clip, exports and publishing across four AI clippers."
+    },
+    "blog_free_opusclip_alternatives": {
+      "eyebrow": "Comparison",
+      "title": "Best free OpusClip alternatives",
+      "label": "Free OpusClip alternatives",
+      "description": "What the free tiers of hosted clippers include, and open-source tools with no watermark."
+    },
     "blog_supoclip_vs_opusclip": {
       "label": "SupoClip vs OpusClip",
       "eyebrow": "Comparison",
@@ -156,6 +168,12 @@
       "title": "Turn Twitch VODs into TikTok clips and Shorts",
       "label": "Twitch VOD to Shorts",
       "description": "Review spoken highlights, preserve gameplay context, and export vertical clips."
+    },
+    "blog_how_to_make_money_clipping": {
+      "eyebrow": "Make money clipping",
+      "title": "How to make money clipping",
+      "label": "Make money clipping",
+      "description": "How Whop Content Rewards, client retainers, and platform rules actually pay—with an interactive calculator."
     },
     "blog_how_to_clip_gta_6": {
       "eyebrow": "GTA 6 clipping",

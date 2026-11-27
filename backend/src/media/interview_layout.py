@@ -18,15 +18,15 @@ own and switches only at the edit:
   frame is full (reason ``group``).
 - ``single``: one person (or two people close enough to share a crop) in a
   tight, head-and-shoulders 9:16 crop.
-- ``cover``: live footage without a close subject (a plate of food, a
-  product, a street, a distant figure) fills the frame with a full-height
-  9:16 crop on what is in focus, or on the lone small face. Reported as
-  ``single`` with reason ``cover``: to captions and the hook title it is a
-  frame-filling crop like any other.
-- ``fit``: an on-screen paragraph (a tweet, a document, an explainer
-  graphic), a still picture without people (a chart, a screenshot), a crowd
-  or people who cannot be divided into two panels keep the whole picture on a
-  blurred background.
+- ``cover``: footage without a close subject (a plate of food, a product, a
+  street, a distant figure, a crowd or a group that cannot be divided into
+  two panels) fills the frame with a full-height 9:16 crop on what is in
+  focus, on the lone small face, or on the part of the group that shares one
+  crop. Reported as ``single`` with reason ``cover``: to captions and the
+  hook title it is a frame-filling crop like any other.
+- ``fit``: content, confirmed by reading the frame: a document, a tweet, a
+  quiz card, a labelled chart or screenshot keeps the whole picture on a
+  blurred background (``scene_context.content_reason``). Nothing else does.
 
 Crops follow their face with the same eased, dead-zoned trajectory as the
 tracked crop, so a tripod shot stays still and a handheld one is followed.
@@ -55,7 +55,7 @@ import numpy as np
 
 from .common import HOOK_TITLE_SECONDS, UPSCALE_SHARPEN_FILTER, logger
 from .ffmpeg import clamp_even, round_to_even
-from .scene_context import COVER_MAX_TEXT_BLOCK_RATE, COVER_MIN_CAMERA_MOTION, COVER_MIN_MOTION
+from .scene_context import COVER_MIN_CAMERA_MOTION, content_reason
 
 Box = Tuple[float, float, float, float]
 FaceFrame = Tuple[float, Sequence[Box]]
@@ -179,9 +179,27 @@ CLUSTER_MIN_SAMPLES = 2
 PAIR_MIN_TOGETHER = 0.3
 # Cover: mean 8-bit change between analysis samples that marks live footage
 # even where the motion measurement gave up (a whip pan, a fast handheld move).
-COVER_MIN_DIFFERENCE = 10.0
 # A face cluster this steady in a shot without a close subject is its subject.
 COVER_FACE_SUPPORT = 0.6
+
+# Over the shoulder at equal size: the person facing the lens has both eyes apart (their spacing is
+# FACING_MIN_EYE_RATIO of the face's width or more). On the back of a head the detector still fires,
+# with the eyes and the corners of the mouth drawn together (both at or under the TURNED ratios). A
+# person in profile, who may well be the one speaking, keeps a visible mouth width and is not "behind";
+# two people in profile (a side-on two-shot) keep their panels.
+FACING_MIN_EYE_RATIO = 0.27
+TURNED_MAX_EYE_RATIO = 0.12
+TURNED_MAX_MOUTH_RATIO = 0.1
+# A layout that changes where the camera did not cut (someone leaves a two-shot, a face is lost and
+# found again) holds at least this long on both sides. Shorter than that it is a flash of another
+# framing in one continuous shot, and the stretch stays with the neighbour it was not cut from.
+UNCUT_HOLD_SECONDS = 1.2
+# A change this close to a camera cut is on that cut.
+CUT_MATCH_SECONDS = 0.12
+# Frames looked at per two-shot, and their width, for that test.
+FACING_PROBE_FRAMES = 5
+FACING_PROBE_WIDTH = 960
+
 
 # A lone person on camera (``plan_solo_layout``) gets the single crop only when
 # its face centre lands at or above this share of the output height; lower,
@@ -411,25 +429,14 @@ def _group_panels(
 
 def _cover_centre(
     clusters: Sequence[Dict[str, Any]], evidence: Sequence[Any], width: int
-) -> Optional[float]:
-    """Centre (0-1) of a full-height crop for a shot without a close subject, or None to keep the whole frame.
+) -> float:
+    """Centre (0-1) of the full-height crop for a shot without a close subject.
 
-    Live footage fills the frame the way a short-form editor cuts it; a still
-    picture (a chart, a screenshot, a photo of a document) and a shot showing
-    a paragraph keep the whole frame. The crop sits on a steady face, however
-    small, and otherwise on the densest detail (``focus_center``).
+    Footage fills the frame the way a short-form editor cuts it. The crop sits on a steady face, however
+    small, and otherwise on the densest detail (``focus_center``); the middle when nothing was measured.
+    Whether the shot is content that keeps the whole frame instead is decided by reading it
+    (``scene_context.content_reason``), not here.
     """
-    if not evidence:
-        return None
-    moving = (
-        float(np.median([e.motion for e in evidence])) >= COVER_MIN_MOTION
-        or float(np.median([e.camera_motion for e in evidence])) >= COVER_MIN_CAMERA_MOTION
-        or float(np.median([e.difference for e in evidence])) >= COVER_MIN_DIFFERENCE
-    )
-    if not moving:
-        return None
-    if sum(e.text_block_lines >= 2 for e in evidence) / len(evidence) > COVER_MAX_TEXT_BLOCK_RATE:
-        return None
     steady = [c for c in clusters if c["support"] >= COVER_FACE_SUPPORT]
     if steady:
         subject = max(steady, key=lambda c: c["box"][3])
@@ -441,17 +448,135 @@ def _cover_centre(
         for t, box in cluster["track"].items():
             if not _edge_cut(box, width) and (t not in seen or box[3] > seen[t][3]):
                 seen[t] = box
-    if len(seen) >= COVER_FACE_SUPPORT * len(evidence):
+    if evidence and len(seen) >= COVER_FACE_SUPPORT * len(evidence):
         return float(np.median([_centre(b)[0] for b in seen.values()])) / max(width, 1)
+    if not evidence:
+        return 0.5
     return float(np.median([getattr(e, "focus_center", 0.5) for e in evidence]))
+
+
+def _group_cover_centre(people: Sequence[Dict[str, Any]], width: int, crop_w: int) -> float:
+    """Centre (0-1) of the full-height crop holding the most of a group that is not a row.
+
+    The window with the most people whose faces fit side by side in one crop; of equals, the larger faces.
+    One person always fits, so a crowd is framed on its most prominent member rather than shown small.
+    """
+    row = sorted(people, key=lambda c: _centre(c["box"])[0])
+    best: Optional[Tuple[int, float, float]] = None
+    for first in range(len(row)):
+        for last in range(first, len(row)):
+            x, _, w, _ = _union([c["box"] for c in row[first:last + 1]])
+            if w > crop_w and last > first:
+                break
+            key = (last - first + 1, sum(c["box"][3] for c in row[first:last + 1]))
+            if best is None or key > best[:2]:
+                best = (key[0], key[1], (x + w / 2) / max(width, 1))
+    return best[2] if best else 0.5
+
+
+def turned_away(ratios: Optional[Sequence[Optional[Tuple[float, float]]]]) -> Optional[int]:
+    """Index (0 or 1) of the person seen from behind in an over-the-shoulder two-shot, else None.
+
+    ``ratios`` are the two people's (eye spacing, mouth width) as shares of their face widths. Only a
+    clear difference counts: one facing the lens, the other with eyes and mouth collapsed, which is
+    the back of a head. A profile is not that. Unknown values never change a layout.
+    """
+    if not ratios or len(ratios) != 2 or ratios[0] is None or ratios[1] is None:
+        return None
+
+    def facing(person: Tuple[float, float]) -> bool:
+        return person[0] >= FACING_MIN_EYE_RATIO
+
+    def behind(person: Tuple[float, float]) -> bool:
+        return person[0] <= TURNED_MAX_EYE_RATIO and person[1] <= TURNED_MAX_MOUTH_RATIO
+
+    first, second = ratios
+    if facing(first) and behind(second):
+        return 1
+    if facing(second) and behind(first):
+        return 0
+    return None
+
+
+def eye_ratios(
+    detections: Sequence[Sequence[Sequence[float]]], boxes: Sequence[Box], scale: float = 1.0,
+) -> List[Optional[Tuple[float, float]]]:
+    """Per face box, the median (eye spacing, mouth width) over face width in the frames where that
+    face was found.
+
+    ``detections`` holds, per frame, YuNet rows with landmarks (x, y, w, h, score, right eye x, y, left
+    eye x, y, nose x, y, right mouth corner x, y, left mouth corner x, y) in probe pixels; ``scale``
+    turns them into the boxes' pixels. A face seen in fewer than two frames is unknown.
+    """
+    found: List[List[Tuple[float, float]]] = [[] for _ in boxes]
+    for frame in detections:
+        for row in frame:
+            x, y, w, h = (float(v) * scale for v in row[:4])
+            if w <= 0 or len(row) < 15:
+                continue
+            cx, cy = x + w / 2, y + h / 2
+            for index, (bx, by, bw, bh) in enumerate(boxes):
+                if bx - 0.3 * bw <= cx <= bx + 1.3 * bw and by - 0.3 * bh <= cy <= by + 1.3 * bh:
+                    eyes = abs(float(row[7]) - float(row[5])) * scale / w
+                    mouth = abs(float(row[13]) - float(row[11])) * scale / w
+                    found[index].append((eyes, mouth))
+                    break
+    return [
+        (float(np.median([v[0] for v in values])), float(np.median([v[1] for v in values])))
+        if len(values) >= 2 else None
+        for values in found
+    ]
+
+
+def probe_eye_ratios(
+    input_path: Path, start: float, end: float, boxes: Sequence[Box], width: int, height: int,
+) -> Optional[List[Optional[Tuple[float, float]]]]:
+    """``eye_ratios`` of a stretch of the clip, from a few of its frames. None when they cannot be read."""
+    from .face_detection import open_yunet_detector
+
+    span = end - start
+    if span <= 0 or width < 2 or height < 2:
+        return None
+    detector = open_yunet_detector()
+    if detector is None:
+        return None
+    probe_w = int(round_to_even(min(FACING_PROBE_WIDTH, width)))
+    probe_h = int(round_to_even(height * probe_w / width))
+    command = [
+        "ffmpeg", "-v", "error", "-an", "-sn", "-ss", f"{start:.3f}", "-t", f"{span:.3f}", "-i", str(input_path),
+        "-vf", f"fps={FACING_PROBE_FRAMES / span:.4f},scale={probe_w}:{probe_h}",
+        "-pix_fmt", "bgr24", "-f", "rawvideo", "-",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    size = probe_w * probe_h * 3
+    count = len(result.stdout) // size if result.returncode == 0 else 0
+    if count < 1:
+        return None
+    frames = np.frombuffer(result.stdout[:count * size], dtype=np.uint8).reshape(count, probe_h, probe_w, 3)
+    try:
+        detections = [detector.detect(frame, landmarks=True) for frame in frames]
+    except Exception as exc:  # noqa: BLE001 - an unknown answer keeps the two-shot as it was
+        logger.debug("Facing probe failed: %s", exc)
+        return None
+    return eye_ratios(detections, boxes, width / probe_w)
 
 
 def _classify(
     segment: Segment, samples: Sequence[FaceFrame], width: int, height: int, crop_w: int,
-    evidence: Sequence[Any] = (), allow_pair: bool = True,
+    evidence: Sequence[Any] = (), allow_pair: bool = True, facing: Any = None, content: Any = None,
 ) -> Segment:
     """The composition of one stretch of a shot. ``allow_pair=False`` never stacks: the stretch is part of a
-    two-shot where only one side is on screen, so it frames whoever is there."""
+    two-shot where only one side is on screen, so it frames whoever is there.
+
+    ``facing(start, end, boxes)`` returns, per face box, how far apart its eyes and its mouth corners are as
+    shares of its width (None when it cannot tell). Two people of equal size where one faces the lens and the
+    other shows the back of the head are an over-the-shoulder shot: the one facing the lens is the subject.
+
+    ``content(segment, evidence, x)`` says why a shot without a close subject is content that keeps the whole
+    frame (a chart, a screenshot, a card), or None: it then fills the frame with a full-height crop at ``x``."""
     segment.times = [t for t, _ in samples]
     if segment.graphic:
         segment.kind, segment.reason = "fit", "graphic"
@@ -464,11 +589,13 @@ def _classify(
         and c["box"][3] >= height * MIN_FACE_H_FRAC
     ]
 
-    def cover(reason: str) -> Segment:
-        x = _cover_centre(clusters, evidence, width)
-        segment.kind, segment.reason = ("fit" if x is None else "cover"), reason
-        if x is not None:
-            segment.cover_x = x
+    def cover(reason: str, x: Optional[float] = None) -> Segment:
+        x = _cover_centre(clusters, evidence, width) if x is None else x
+        found = content(segment, evidence, x) if content else None
+        if found:
+            segment.kind, segment.reason = "fit", found
+            return segment
+        segment.kind, segment.reason, segment.cover_x = "cover", reason, x
         return segment
 
     if not people:
@@ -486,8 +613,9 @@ def _classify(
             panels = _group_panels(people, width, height)
     if len(people) >= 3:
         if panels is None:
-            segment.kind, segment.reason = "fit", "group"
-            return segment
+            # A crowd, a call grid, people at different heights: no two panels hold them. The frame fills
+            # with the part of the group that shares one crop.
+            return cover("group", _group_cover_centre(people, width, crop_w))
         segment.kind, segment.reason = "pair", "group"
         segment.people = [_union([c["box"] for c in side]) for side in panels]
         segment.tracks = [_union_track(side) for side in panels]
@@ -509,9 +637,16 @@ def _classify(
             return segment
         elif (small >= large * PAIR_MIN_SIZE_RATIO and dy <= height * PAIR_MAX_DY_FRAC
               and not any(_edge_cut(c["box"], width) for c in people)):
-            segment.kind, segment.reason = "pair", "two_people"
-            segment.people, segment.tracks = [lb, rb], [left["track"], right["track"]]
-            segment.members = [[left["track"]], [right["track"]]]
+            turned = turned_away(facing(segment.start, segment.end, [lb, rb]) if facing else None)
+            if turned is None:
+                segment.kind, segment.reason = "pair", "two_people"
+                segment.people, segment.tracks = [lb, rb], [left["track"], right["track"]]
+                segment.members = [[left["track"]], [right["track"]]]
+                return segment
+            # A panel for the back of a head would take half the frame from the person who is looking at us.
+            subject = right if turned == 0 else left
+            segment.kind, segment.reason = "single", "over_shoulder"
+            segment.people, segment.tracks = [subject["box"]], [subject["track"]]
             return segment
         else:
             # Over the shoulder: the near person is a huge, edge-cut blur facing
@@ -814,8 +949,13 @@ def _segments(
     crop_w: int,
     dense: Any = None,
     picture: Any = None,
+    facing: Any = None,
+    read_words: Any = None,
+    known: Optional[set] = None,
 ) -> List[Segment]:
     """Camera shots, divided again where a graphic or the people on screen change.
+
+    ``facing(start, end, boxes)`` tells an over-the-shoulder shot from a two-shot (``_classify``).
 
     ``dense(start, end)`` returns finer face samples of a stretch (or nothing): a stretch with two people is
     classified and settled on those, so its layout changes land on the moment (``_settle_pair``). ``picture(t)`` returns the cut probe's
@@ -824,6 +964,10 @@ def _segments(
     The cut detector misses some edits (b-roll cut into a close-up, a cut
     between similar colours). A lasting change in the number of people, or a
     paragraph appearing, divides the shot there too.
+
+    ``read_words(time)`` reads the words on a frame (``screen_text.read_frame_words``). A stretch keeps the
+    whole frame only when reading it confirms content (``scene_context.content_reason``); a paragraph the
+    shape tests see in brickwork or on a shelf never does.
     """
     cuts = sorted({float(c) for c in scene_cuts if 0 < c < duration})
     bounds = [0.0, *cuts, duration]
@@ -857,6 +1001,16 @@ def _segments(
         return (float(getattr(near, "camera_motion", 0.0)) >= COVER_MIN_CAMERA_MOTION
                 or float(getattr(near, "difference", 0.0)) >= MOVING_MIN_DIFFERENCE)
 
+    def content(segment: Segment, found: Sequence[Any], x: float) -> Optional[str]:
+        found = list(found) or between(segment.start, segment.end)
+        return content_reason(
+            found, "", segment.start, segment.end, x, crop_w / max(width, 1), read_words, known)
+
+    def confirmed_graphic(a: float, b: float, part: Sequence[FaceFrame]) -> bool:
+        found = evidence(part) or between(a, b)
+        x = _cover_centre(_clusters(part, width, height), found, width) if part else 0.5
+        return content(Segment(a, b), found, x) is not None
+
     def signage(part: Sequence[FaceFrame]) -> bool:
         # A paragraph in a handheld shot of people is a sign or a menu behind
         # them, not a graphic laid over the picture: the people are the shot.
@@ -879,7 +1033,7 @@ def _segments(
         graphic = [blocks.get(round(float(t), 3), False) for t, _ in shot]
         for a, b, is_graphic in _graphic_spans(times, graphic, start, end):
             part = [(t, faces) for t, faces in shot if a <= t < b]
-            if is_graphic and signage(part):
+            if is_graphic and (signage(part) or not confirmed_graphic(a, b, part)):
                 is_graphic = False
             pieces = (
                 [(a, b, None)] if is_graphic or not part else
@@ -890,14 +1044,17 @@ def _segments(
                 sub = [(t, faces) for t, faces in part if c <= t < d]
                 segment = Segment(c, d, graphic=bool(is_graphic) and bool(sub))
                 if sub:
-                    classified = _classify(segment, sub, width, height, crop_w, evidence(sub))
+                    classified = _classify(
+                        segment, sub, width, height, crop_w, evidence(sub), facing=facing, content=content)
                     if classified.kind == "pair":
                         fine = [
                             (t, faces) for t, faces in (dense(c, d) if dense else ())
                             if not any(abs(t - cut) < CUT_GUARD_SECONDS for cut in cuts)
                         ]
                         if len(fine) > len(sub):
-                            again = _classify(Segment(c, d), fine, width, height, crop_w, between(c, d))
+                            again = _classify(
+                                Segment(c, d), fine, width, height, crop_w, between(c, d), facing=facing,
+                                content=content)
                             if again.kind == "pair":
                                 classified, sub = again, fine
                     segments.extend(_settle_pair(
@@ -906,7 +1063,8 @@ def _segments(
                 elif segments:
                     segments[-1].end = d
                 else:
-                    segment.kind, segment.reason = "fit", "unsampled"
+                    # Nothing was sampled here: the centre of the frame, full height.
+                    segment.kind, segment.reason, segment.cover_x = "cover", "unsampled", 0.5
                     segments.append(segment)
             segments[first:] = _hold_pair(segments[first:], width, height, gone)
     index = 0
@@ -920,6 +1078,119 @@ def _segments(
             del segments[index]
             continue
         index += 1
+    return segments
+
+
+def _steady(segments: List[Segment], cuts: Sequence[float]) -> List[Segment]:
+    """Take out layouts that flash by inside one continuous shot.
+
+    A stretch shorter than ``UNCUT_HOLD_SECONDS`` whose start or end is not a camera cut joins the
+    neighbour on that side. When neither side is a cut it joins the neighbour framed the same way,
+    else the longer one. A short shot between two cuts is the source's own editing and keeps its
+    framing.
+    """
+    def on_cut(time: float) -> bool:
+        return any(abs(time - cut) <= CUT_MATCH_SECONDS for cut in cuts)
+
+    def length(segment: Segment) -> float:
+        return segment.end - segment.start
+
+    segments = list(segments)
+    index = 0
+    while index < len(segments) and len(segments) > 1:
+        segment = segments[index]
+        # The clip's first and last stretch are how it opens and closes (a two-shot that opens on one
+        # person starts on that person); only a stretch between two others is a flash.
+        inner = 0 < index < len(segments) - 1
+        left = inner and not on_cut(segment.start)
+        right = inner and not on_cut(segment.end)
+        if length(segment) >= UNCUT_HOLD_SECONDS or not (left or right):
+            index += 1
+            continue
+        if left and right:
+            before, after = segments[index - 1], segments[index + 1]
+            if (before.kind == segment.kind) != (after.kind == segment.kind):
+                # It joins the framing it already has: a moment of one person stays a single crop
+                # instead of holding two panels over a place where nobody is.
+                keep = index - 1 if before.kind == segment.kind else index + 1
+            else:
+                keep = index - 1 if length(before) >= length(after) else index + 1
+        else:
+            keep = index - 1 if left else index + 1
+        neighbour = segments[keep]
+        neighbour.start, neighbour.end = min(neighbour.start, segment.start), max(neighbour.end, segment.end)
+        neighbour.times = sorted(set(neighbour.times) | set(segment.times))
+        del segments[index]
+        index = max(0, index - 1)
+    return segments
+
+
+# A single crop follows one face. When that face is somewhere else from one sample to the next, twice or more in
+# one stretch, the crop is not following a person: the camera whips between people, or the stretch holds several
+# shots the cut tests missed and a different person each time. A following crop trails behind and shows walls.
+# Such a stretch gets a still full-height crop where the face mostly is. (Measured on 292 single crops of
+# reviewed clips: one stretch has such jumps, three of them; the other 291 have none or one.)
+SINGLE_JUMP_CROP_FRAC = 0.5      # a jump: the face centre moves by this much of the crop's width between two samples
+SINGLE_MAX_JUMPS = 2             # jumps in one stretch from which the following crop gives way to a still one
+
+
+def _face_jumps(segment: Segment, crop_w: float) -> int:
+    """How often the followed face is somewhere else from one sample to the next."""
+    track = segment.tracks[0] if segment.tracks else {}
+    centres = [_centre(track[t])[0] for t in sorted(track) if segment.start <= t < segment.end]
+    return sum(1 for a, b in zip(centres, centres[1:]) if abs(a - b) > SINGLE_JUMP_CROP_FRAC * crop_w)
+
+
+def _still_where_the_person_is_lost(segments: List[Segment], width: int, height: int) -> List[Segment]:
+    """Single crops that cannot stay on their person hold still instead (see SINGLE_MAX_JUMPS)."""
+    for segment in segments:
+        if segment.kind != "single" or segment.reason != "one_person" or not segment.people:
+            continue
+        crop_w = _single_size(segment.people[0], width, height)[0]
+        if _face_jumps(segment, crop_w) >= SINGLE_MAX_JUMPS:
+            track = segment.tracks[0] if segment.tracks else {}
+            centres = [_centre(track[t])[0] for t in sorted(track) if segment.start <= t < segment.end]
+            segment.cover_x = float(np.median(centres)) / max(width, 1) if centres else 0.5
+            segment.kind, segment.reason = "cover", "person_moves_across_frame"
+    return segments
+
+
+# While a card is up, a glance at a contestant between two full-width stretches would drop the card and bring
+# it back within a couple of seconds. A frame-filling stretch this short between two content stretches stays
+# full width with them.
+CONTENT_HOLD_SECONDS = 2.5
+
+
+def _hold_content(segments: List[Segment]) -> List[Segment]:
+    """Frame-filling stretches shorter than CONTENT_HOLD_SECONDS between two content stretches join them, and a
+    content stretch that short with frame-filling shots on both sides (or at the clip's edge) fills the frame:
+    nobody reads a card in two seconds, and the drop to a third of the screen and back is what a viewer sees."""
+    index = 0
+    while index < len(segments):
+        if segments[index].kind != "fit":
+            index += 1
+            continue
+        stop = index
+        while stop + 1 < len(segments) and segments[stop + 1].kind == "fit":
+            stop += 1
+        if segments[stop].end - segments[index].start < CONTENT_HOLD_SECONDS and len(segments) > stop - index + 1:
+            for segment in segments[index:stop + 1]:
+                segment.kind, segment.reason, segment.cover_x = "cover", "brief_content", 0.5
+        index = stop + 1
+    index = 0
+    while index < len(segments):
+        if segments[index].kind == "fit":
+            index += 1
+            continue
+        stop = index
+        while stop + 1 < len(segments) and segments[stop + 1].kind != "fit":
+            stop += 1
+        between = 0 < index and stop + 1 < len(segments)
+        if between and segments[stop].end - segments[index].start < CONTENT_HOLD_SECONDS:
+            reason = segments[index - 1].reason
+            for segment in segments[index:stop + 1]:
+                segment.kind, segment.reason = "fit", reason
+        index = stop + 1
     return segments
 
 
@@ -1352,6 +1623,7 @@ def plan_interview_layout(
     face_samples: Sequence[FaceFrame],
     context: Sequence[Any],
     input_path: Optional[Path] = None,
+    read_words: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """Per-shot single/pair/fit plan, or None when the clip is not an interview.
 
@@ -1401,13 +1673,33 @@ def plan_interview_layout(
             index -= 1
         return frames[index].reshape(CUT_PROBE_H, CUT_PROBE_W)
 
+    seen: Dict[Tuple[float, float], Optional[List[Optional[Tuple[float, float]]]]] = {}
+
+    def facing(start: float, end: float, boxes: Sequence[Box]) -> Optional[List[Optional[Tuple[float, float]]]]:
+        # The plan is built twice (sampled cuts, then exact ones); most stretches are the same both times.
+        if input_path is None:
+            return None
+        key = (round(start, 2), round(end, 2))
+        if key not in seen:
+            seen[key] = probe_eye_ratios(input_path, start, end, boxes, width, height)
+        return seen[key]
+
+    # Words of the content found so far. The plan is built twice (sampled cuts, then exact ones), so by the
+    # second build every shot is judged against all of the clip's content.
+    known: set = set()
+
     def interview(cuts: Sequence[float]) -> Optional[List[Segment]]:
-        segments = _segments(duration, cuts, face_samples, context, width, height, crop_w, dense, picture)
+        segments = _segments(
+            duration, cuts, face_samples, context, width, height, crop_w, dense, picture, facing, read_words,
+            known)
+        segments = _steady(segments, cuts)
         # A divided group does not make a clip an interview by itself: a
         # three-host podcast or a call gallery keeps speaker framing and the
         # gallery layouts. Beside a real two-shot it is composed like one.
         pairs = [s for s in segments if s.kind == "pair" and s.reason == "two_people"]
-        if sum(s.end - s.start for s in pairs) < PAIR_MIN_SECONDS:
+        # An over-the-shoulder shot is a two-shot too, framed on the person facing the lens.
+        two_shots = pairs + [s for s in segments if s.kind == "single" and s.reason == "over_shoulder"]
+        if sum(s.end - s.start for s in two_shots) < PAIR_MIN_SECONDS:
             return None
         singles = [s for s in segments if s.kind == "single"]
         if not singles and all(min(b[1] for b in s.people) > height * WEBCAM_FACE_TOP for s in pairs):
@@ -1418,7 +1710,8 @@ def plan_interview_layout(
     if segments is None:
         return None
     _pool_setups(segments, width)
-    segments = _merge_neighbours(segments)
+    segments = _merge_neighbours(_still_where_the_person_is_lost(_merge_neighbours(segments), width, height))
+    segments = _merge_neighbours(_hold_content(segments))
     video_filter, lowest = build_interview_filter(segments, width, height)
     summary = [_reported(s) for s in segments]
     logger.info("Interview layout: %s", summary)
@@ -1429,7 +1722,12 @@ def plan_interview_layout(
         "face_bottom": lowest,
     }
     # The hook title sits in the top safe area, which in a stacked two-shot is
-    # the top person's face. Opening on a pair, put it on the panel seam.
-    if any(s.kind == "pair" and s.start < HOOK_TITLE_SECONDS for s in segments):
+    # the top person's face. Opening on a pair, put it on the panel seam. The
+    # title keeps one row for as long as it shows, and in a frame-filling crop
+    # the seam is the face or chest of the person in it: the seam is used when
+    # the two-shot fills most of the title's time, the top otherwise.
+    shown = min(duration, HOOK_TITLE_SECONDS)
+    paired = sum(min(s.end, shown) - s.start for s in segments if s.kind == "pair" and s.start < shown)
+    if paired > shown / 2:
         result["hook_center_y"] = PAIR_SEAM_Y
     return result

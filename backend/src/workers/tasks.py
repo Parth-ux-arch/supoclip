@@ -258,6 +258,56 @@ async def dispatch_scheduled_social_posts(ctx: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+UNLOCKS_PER_RUN = 50
+
+
+async def unlock_paid_previews(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Cron: unlock free previews whose owner asked to before checkout, once the plan is active.
+
+    The page that came back from checkout usually does this first; this covers a closed tab, an
+    App Store purchase finishing in the background, and a webhook that landed late.
+    """
+    from sqlalchemy import text
+
+    from ..api.routes.tasks import unlock_requested_preview
+    from ..database import AsyncSessionLocal
+    from ..services.billing_service import grants_paid_access
+
+    async with AsyncSessionLocal() as db:
+        pending = (
+            await db.execute(
+                text(
+                    """
+                    SELECT t.id, u.plan, u.subscription_status, u.subscription_provider
+                    FROM tasks t JOIN users u ON u.id = t.user_id
+                    WHERE t.preview IS NOT NULL
+                      AND t.preview ? 'unlock_requested_at'
+                      AND NOT t.preview ? 'unlocked_at'
+                      AND t.status = 'completed'
+                      AND (t.preview->>'unlock_requested_at')::timestamptz > NOW() - INTERVAL '14 days'
+                    ORDER BY (t.preview->>'unlock_requested_at')::timestamptz ASC
+                    """
+                )
+            )
+        ).fetchall()
+        await db.commit()
+    # Most people who ask never pay. Only owners with a plan are tried, oldest first, so a buyer is never
+    # stuck behind a page of requests that will never unlock.
+    rows = [
+        row for row in pending
+        if grants_paid_access(row.plan, row.subscription_status, row.subscription_provider)
+    ][:UNLOCKS_PER_RUN]
+    unlocked = 0
+    for row in rows:
+        async with AsyncSessionLocal() as db:
+            try:
+                if await unlock_requested_preview(db, str(row.id)):
+                    unlocked += 1
+            except Exception:  # noqa: BLE001 - one preview must not stop the others
+                logger.exception("Could not unlock preview %s", row.id)
+    return {"pending": len(pending), "checked": len(rows), "unlocked": unlocked}
+
+
 async def refresh_social_metrics(ctx: Dict[str, Any]) -> Dict[str, Any]:
     """Cron: pull fresh audience metrics for recently published posts."""
     from ..database import AsyncSessionLocal
@@ -353,9 +403,12 @@ from ..services.clip_export_service import (
     export_clip_preset,
 )
 from ..services.social_service import PUBLISH_JOB_TIMEOUT_SECONDS
-from . import host_jobs, overflow
+from . import arq_resilience, host_jobs, overflow
 from .job_queue import DEFAULT_QUEUE_NAME
 from .queue_delay import on_video_job_start
+
+# A Redis blip while claiming a job must not end the worker (arq_resilience.py).
+arq_resilience.install()
 
 
 async def on_video_job_begin(ctx) -> None:

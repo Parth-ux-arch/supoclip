@@ -94,7 +94,11 @@ from ..clip_source_map import (
     save_clip_broll,
     save_clip_source_ranges,
 )
-from ..ai import get_most_relevant_parts_by_transcript, max_final_clips_for_duration
+from ..ai import (
+    get_most_relevant_parts_by_transcript,
+    max_final_clips_for_duration,
+    short_source_speech_bounds,
+)
 from ..clip_openings import OPENING_HOOK_PENALTY, opening_text_issue, review_opening
 from ..clip_duration import clip_duration
 from ..config import get_config
@@ -568,6 +572,52 @@ def _sync_plan_ranges(plan: Dict[str, Any], segments: List[Dict[str, Any]]) -> N
             ]
 
 
+SCORE_KEYS = ("hook_score", "engagement_score", "value_score", "shareability_score")
+
+
+def stored_segment_scores(segment: Dict[str, Any]) -> Dict[str, Any]:
+    """Scores of a segment that was stored as JSON, in the shape clips are saved with.
+
+    A checkpoint keeps the model's answer, with the scores nested under ``virality``. The shared
+    analysis cache keeps the render payload, where the same scores are top-level keys. Both are
+    read here, so a clip made from a cached analysis keeps its score and hook type.
+    """
+    virality = segment.get("virality")
+    if hasattr(virality, "model_dump"):
+        virality = virality.model_dump()
+    if isinstance(virality, dict) and virality:
+        return {
+            "virality_score": virality.get("total_score", 0),
+            **{key: virality.get(key, 0) for key in SCORE_KEYS},
+            "hook_type": virality.get("hook_type"),
+        }
+    return {
+        "virality_score": segment.get("virality_score") or 0,
+        **{key: segment.get(key) or 0 for key in SCORE_KEYS},
+        "hook_type": segment.get("hook_type"),
+    }
+
+
+def cached_scores_were_lost(segments: List[Any]) -> bool:
+    """True for a cached analysis whose every moment carries a stored score of zero.
+
+    Until scores were read from both stored shapes, a run that started from the cache wrote the
+    analysis back with every score at zero. A moment the model picked never scores zero, and a
+    starter clip for a video without speech (``fallback``) has no score to lose.
+    """
+    stored = [segment for segment in segments if isinstance(segment, dict) and "virality_score" in segment]
+    if not stored or len(stored) != len(segments):
+        return False
+    return all(
+        not segment.get("virality_score") and not segment.get("hook_type") and not segment.get("virality")
+        for segment in stored
+    )
+
+
+# Clips per task whose edges the model reviews (one small call each).
+EDGE_REVIEW_MAX_CLIPS = 24
+
+
 class VideoService:
     """Service for video processing operations."""
 
@@ -637,6 +687,89 @@ class VideoService:
                     }
                 )
         return sorted(words, key=lambda word: word["start"])
+
+    @staticmethod
+    async def _review_segment_edges(
+        segments: List[Dict[str, Any]],
+        video_path: Path,
+        clip_length: str = "auto",
+    ) -> List[Dict[str, Any]]:
+        """Let the model check where each highlight opens and closes; store the edges it and the code agree on.
+
+        The labels are resolved to sentences first (``media.sentence_bounds``). The model then sees the
+        sentences around each edge and may move it a few sentences: to the question an opening answers, to
+        the line that names "he", to the answer or the payoff a closing stops short of. ``apply_edge_review``
+        accepts a move only onto a sentence edge, close by and inside the length range. The result is stored
+        as ``edge_seconds`` (first word start, last word end), which the render resolves exactly. Segments
+        that already carry them, or that have explicit ranges, are left alone. Any failure keeps the
+        rule-based edges.
+        """
+        from ..ai import review_clip_edges
+        from ..media.sentence_bounds import apply_edge_review, edge_review_request, resolve_units, unit_index_for
+
+        if not get_config().clip_edge_review:
+            return segments
+        index = unit_index_for(video_path)
+        if index is None:
+            return segments
+        bounds = clip_duration(clip_length)
+        requests: List[Dict[str, Any]] = []
+        resolved: Dict[int, tuple[int, int]] = {}
+        for number, segment in enumerate(segments, start=1):
+            if len(requests) >= EDGE_REVIEW_MAX_CLIPS:
+                break  # best-first list: the tail is reserve that rarely renders
+            if (segment.get("edge_seconds") or segment.get("source_ranges") or segment.get("keep_ranges")
+                    or segment.get("hook_type") == "fallback"):
+                continue
+            try:
+                start = parse_timestamp_to_seconds(str(segment.get("start_time") or ""))
+                end = parse_timestamp_to_seconds(str(segment.get("end_time") or ""))
+                units = resolve_units(index, float(start), float(end), float(bounds.maximum))
+            except Exception:
+                units = None
+            if units is None:
+                continue
+            resolved[number] = units
+            # What the clip is about: a leftover of the topic before, or a payoff that comes one line after
+            # the cut, can only be told against it.
+            requests.append(edge_review_request(
+                index, units[0], units[1], number,
+                title=str(segment.get("hook_title") or ""), about=str(segment.get("reasoning") or "")[:400]))
+        if not requests:
+            return segments
+        chosen = await review_clip_edges(requests)
+        moved = 0
+        for number, (first, last) in resolved.items():
+            segment = segments[number - 1]
+            opening_id, closing_id = chosen.get(number, (first, last))
+            new_first, new_last = apply_edge_review(
+                index, first, last, opening_id, closing_id, float(bounds.minimum), float(bounds.maximum))
+            if (opening_id, closing_id) != (new_first, new_last):
+                logger.info(
+                    "Edge review proposal for clip %s-%s not taken as given (asked %+d / %+d sentences, applied %+d / %+d)",
+                    segment.get("start_time"), segment.get("end_time"),
+                    opening_id - first, closing_id - last, new_first - first, new_last - last,
+                )
+            if (new_first, new_last) != (first, last):
+                moved += 1
+                logger.info(
+                    "Edge review moved clip %s-%s: opens %d sentence(s) %s, closes %d sentence(s) %s",
+                    segment.get("start_time"), segment.get("end_time"),
+                    abs(new_first - first), "earlier" if new_first < first else "later",
+                    abs(new_last - last), "later" if new_last > last else "earlier",
+                )
+                segment["start_time"] = seconds_to_mmss(math.floor(index.unit(new_first).start))
+                segment["end_time"] = seconds_to_mmss(math.floor(index.unit(new_last).end))
+                segment["text"] = index.text(new_first, new_last)
+                hook_start = segment.get("hook_start_time")
+                try:
+                    if hook_start and parse_timestamp_to_seconds(str(hook_start)) < index.unit(new_first).start:
+                        segment["hook_start_time"] = segment["hook_end_time"] = None
+                except Exception:
+                    segment["hook_start_time"] = segment["hook_end_time"] = None
+            segment["edge_seconds"] = [round(index.unit(new_first).start, 3), round(index.unit(new_last).end, 3)]
+        logger.info("Edge review: %d of %d clips moved", moved, len(resolved))
+        return segments
 
     @staticmethod
     def _refine_segment_openings(
@@ -1219,7 +1352,7 @@ class VideoService:
     ) -> str:
         """
         Generate transcript from video using the configured provider
-        (assemblyai, whisper, or youtube_captions).
+        (assemblyai, soniox, whisper, or youtube_captions).
         Runs in thread pool to avoid blocking.
         """
         logger.info(f"Generating transcript for: {video_path}")
@@ -1243,6 +1376,8 @@ class VideoService:
         performance_context: Optional[str] = None,
         clip_length: str = "auto",
         instructions: Optional[str] = None,
+        *,
+        source_duration: Optional[float] = None,
     ) -> Any:
         """
         Analyze transcript with AI to find relevant segments.
@@ -1257,6 +1392,7 @@ class VideoService:
             performance_context=performance_context,
             clip_length=clip_length,
             include_reserve=True,
+            source_duration=source_duration,
             **({"instructions": instructions} if instructions else {}),
         )
         logger.info(
@@ -1813,10 +1949,20 @@ class VideoService:
             try:
                 cached_analysis = json.loads(cached_analysis_json)
                 segments = cached_analysis.get("most_relevant_segments", [])
+                has_checkpoint = any(checkpoint.get(key) for key in ("analysis", "candidates", "segments"))
                 if not segments and not (checkpoint.get("candidates") or checkpoint.get("segments")):
                     logger.info(
                         "Ignoring cached transcript analysis with no clip segments"
                     )
+                elif not has_checkpoint and (
+                    cached_scores_were_lost(segments)
+                    or (
+                        segments
+                        and all(isinstance(segment, dict) and segment.get("hook_type") == "fallback" for segment in segments)
+                        and short_source_speech_bounds(transcript, file_duration, clip_length) is not None
+                    )
+                ):
+                    logger.info("Ignoring cached transcript analysis without usable ranked moments")
                 else:
 
                     class _SimpleResult:
@@ -1852,6 +1998,7 @@ class VideoService:
                 clip_signals=clip_signals,
                 performance_context=performance_context,
                 clip_length=clip_length,
+                source_duration=file_duration,
                 **({"instructions": instructions} if instructions else {}),
             )
 
@@ -1875,21 +2022,13 @@ class VideoService:
         transcript_data = load_cached_transcript_data(video_path)
         for segment in ([] if prepared_segments else raw_segments):
             if isinstance(segment, dict):
-                virality = segment.get("virality") or {}
-                if hasattr(virality, "model_dump"):
-                    virality = virality.model_dump()
                 segment_payload = {
                     "start_time": segment.get("start_time"),
                     "end_time": segment.get("end_time"),
                     "text": segment.get("text", ""),
                     "relevance_score": segment.get("relevance_score", 0.0),
                     "reasoning": segment.get("reasoning", ""),
-                    "virality_score": virality.get("total_score", 0),
-                    "hook_score": virality.get("hook_score", 0),
-                    "engagement_score": virality.get("engagement_score", 0),
-                    "value_score": virality.get("value_score", 0),
-                    "shareability_score": virality.get("shareability_score", 0),
-                    "hook_type": virality.get("hook_type"),
+                    **stored_segment_scores(segment),
                     "hook_title": segment.get("hook_title"),
                     "hook_start_time": segment.get("hook_start_time"),
                     "hook_end_time": segment.get("hook_end_time"),
@@ -1936,6 +2075,12 @@ class VideoService:
         except Exception:
             # A heuristic must never fail the task; keep the AI's openings.
             logger.exception("Opening review failed; keeping the selected openings")
+        try:
+            if not prepared_segments:
+                segments_json = await VideoService._review_segment_edges(segments_json, video_path, clip_length)
+        except Exception:
+            # Never fail the task over an edge: the rule-based sentence edges stand.
+            logger.exception("Edge review failed; keeping the resolved edges")
 
         clip_limit = max_final_clips_for_duration(file_duration, runtime_config.max_clips)
         if processing_mode == "fast":

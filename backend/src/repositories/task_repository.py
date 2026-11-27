@@ -52,8 +52,12 @@ class TaskRepository:
         edit_style: Optional[Dict[str, Any]] = None,
         idempotency: Optional[tuple[str, str]] = None,
         team_id: Optional[str] = None,
+        preview: Optional[Dict[str, Any]] = None,
+        source_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Create a new task and return its ID.
+
+        ``preview`` marks a free preview project (set in the same transaction, never charged).
 
         ``edit_style`` is ``EditStyle.to_json()``. Only a non-empty style adds the column, with a third INSERT
         shape, so tasks without dynamic edits keep the two legacy statements byte for byte (and NULL in the row).
@@ -149,6 +153,16 @@ class TaskRepository:
                     text("UPDATE tasks SET team_id = :team_id WHERE id = :task_id"),
                     {"team_id": team_id, "task_id": task_id},
                 )
+            if preview is not None:
+                await db.execute(
+                    text("UPDATE tasks SET preview = CAST(:preview AS JSONB) WHERE id = :task_id"),
+                    {"preview": json.dumps(preview), "task_id": task_id},
+                )
+            if source_metadata:
+                await db.execute(
+                    text("UPDATE tasks SET source_metadata = CAST(:metadata AS JSONB) WHERE id = :task_id"),
+                    {"metadata": json.dumps(source_metadata), "task_id": task_id},
+                )
             if charge_minutes:
                 await record_minute_usage(
                     db, user_id, task_id, source_duration_seconds, team_id=team_id
@@ -184,6 +198,33 @@ class TaskRepository:
             await db.execute(
                 text("UPDATE tasks SET workflow_plan = CAST(:plan AS JSONB) WHERE id = :task_id"),
                 {"task_id": task_id, "plan": None if plan is None else json.dumps(plan)},
+            )
+            await commit_unless_editing(db)
+        except BaseException:
+            await db.rollback()
+            raise
+
+    @staticmethod
+    async def merge_preview(db: AsyncSession, task_id: str, fields: Dict[str, Any]) -> None:
+        """Add or replace some of a free preview's fields, keeping the others (an unlock request made
+        while the worker runs must survive the worker writing what it found)."""
+        try:
+            await db.execute(
+                text("UPDATE tasks SET preview = preview || CAST(:fields AS JSONB) WHERE id = :task_id AND preview IS NOT NULL"),
+                {"task_id": task_id, "fields": json.dumps(fields)},
+            )
+            await commit_unless_editing(db)
+        except BaseException:
+            await db.rollback()
+            raise
+
+    @staticmethod
+    async def save_preview(db: AsyncSession, task_id: str, preview: Dict[str, Any]) -> None:
+        """Store a free preview's state (what was found, which clip rendered, the locked rest)."""
+        try:
+            await db.execute(
+                text("UPDATE tasks SET preview = CAST(:preview AS JSONB) WHERE id = :task_id AND preview IS NOT NULL"),
+                {"task_id": task_id, "preview": json.dumps(preview)},
             )
             await commit_unless_editing(db)
         except BaseException:
@@ -251,12 +292,17 @@ class TaskRepository:
         source_key: str,
         *,
         edit_identity: Optional[tuple[Dict[str, Any], str]] = None,
+        output_format: Optional[str] = None,
         team_id: Optional[str] = None,
     ):
         """This workspace's queued or processing task for the same video, if any.
 
         Tasks created before ``source_key`` was stored are matched by
         recomputing the key from the saved source URL.
+
+        ``output_format`` scopes deduplication to the requested layout
+        (``vertical``, ``vertical_split``, ``vertical_fit``, ``original``, etc.); older rows
+        missing ``source_metadata.output_format`` default to ``vertical``.
 
         ``edit_identity`` = ``(EditStyle.to_json(), caption_template)`` for a
         request with dynamic edits: only an in-flight task with that same stored
@@ -266,9 +312,17 @@ class TaskRepository:
         """
         if not user_id or not source_key:
             return None
+        params = {"user": user_id, "team_id": team_id, "key": source_key}
+        render_filter = ""
+        if output_format is not None:
+            params["output_format"] = output_format
+            render_filter = """
+                AND COALESCE(t.source_metadata->>'output_format', 'vertical') = :output_format
+            """
         if edit_identity is not None:
             return await TaskRepository._find_active_source_task_with_style(
-                db, user_id, source_key, edit_identity, team_id=team_id
+                db, user_id, source_key, edit_identity, team_id=team_id,
+                render_filter=render_filter, params=params,
             )
         scope = TaskRepository._workspace_scope(team_id)
         direct = await db.execute(
@@ -280,10 +334,11 @@ class TaskRepository:
                 WHERE {scope}
                   AND t.status IN ('queued', 'processing')
                   AND t.source_metadata->>'source_key' = :key
+                  {render_filter}
                 ORDER BY t.created_at ASC
                 """
             ),
-            {"user": user_id, "team_id": team_id, "key": source_key},
+            params,
         )
         for found in direct.all():
             if not TaskRepository._renders_dynamic_edits(found):
@@ -301,10 +356,11 @@ class TaskRepository:
                 WHERE {scope}
                   AND t.status IN ('queued', 'processing')
                   AND COALESCE(t.source_metadata->>'source_key', '') = ''
+                  {render_filter}
                 ORDER BY t.created_at ASC
                 """
             ),
-            {"user": user_id, "team_id": team_id},
+            params,
         )
         for row in rows:
             if TaskRepository._renders_dynamic_edits(row):
@@ -333,6 +389,8 @@ class TaskRepository:
         source_key: str,
         edit_identity: tuple[Dict[str, Any], str],
         *,
+        render_filter: str,
+        params: Dict[str, Any],
         team_id: Optional[str] = None,
     ):
         from ..edit_fx.settings import read_edit_style
@@ -349,10 +407,11 @@ class TaskRepository:
                 LEFT JOIN sources s ON s.id = t.source_id
                 WHERE {TaskRepository._workspace_scope(team_id)}
                   AND t.status IN ('queued', 'processing')
+                  {render_filter}
                 ORDER BY t.created_at ASC
                 """
             ),
-            {"user": user_id, "team_id": team_id},
+            params,
         )
         for row in rows.all():
             if (row.caption_template or "default") != template:
@@ -458,6 +517,7 @@ class TaskRepository:
             "workflow_options": getattr(row, "workflow_options", None) or {},
             "workflow_plan": getattr(row, "workflow_plan", None),
             "edit_style": getattr(row, "edit_style", None),
+            "preview": getattr(row, "preview", None),
             "created_at": row.created_at,
             "updated_at": row.updated_at,
         }

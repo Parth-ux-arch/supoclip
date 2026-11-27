@@ -8,7 +8,9 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { CreatorCodeField } from "@/components/billing/creator-code-field";
-import { CapacityIllustration, FontIllustration, LengthIllustration } from "@/components/billing/upgrade-illustrations";
+import { UpgradeExamplesGallery } from "@/components/billing/upgrade-examples-gallery";
+import { AgentFilm } from "@/components/agent/onboarding/agent-film";
+import { CountUp, FontIllustration, LengthIllustration } from "@/components/billing/upgrade-illustrations";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import type { BillingSummary } from "@/hooks/use-billing-summary";
 import { useTeamRole } from "@/hooks/use-workspace";
@@ -39,6 +41,10 @@ export type UpgradeReason =
   | { kind: "member_limit"; limit: number; remaining: number; requiredMinutes?: number }
   | { kind: "video_too_long"; durationSeconds: number; maxSeconds: number }
   | { kind: "custom_fonts" }
+  /** Agent is a Creator feature; `trialUsed` when a Pro account has used its free messages. */
+  | { kind: "agent"; trialUsed?: boolean }
+  /** A free preview: `more` clips are waiting to be unlocked. */
+  | { kind: "preview"; more: number }
   | { kind: "explore" };
 
 type UpgradeBilling = Pick<
@@ -276,6 +282,18 @@ function copyFor(
         title: t("upgrade.fonts.title"),
         body: t("upgrade.fonts.body"),
       };
+    case "preview":
+      return {
+        eyebrow: t("upgrade.preview.eyebrow"),
+        title: t("upgrade.preview.title", { count: reason.more }),
+        body: t("upgrade.preview.body"),
+      };
+    case "agent":
+      return {
+        eyebrow: t("upgrade.agent.eyebrow"),
+        title: t(reason.trialUsed ? "upgrade.agent.titleUsed" : "upgrade.agent.title"),
+        body: t(reason.trialUsed ? "upgrade.agent.bodyUsed" : "upgrade.agent.body"),
+      };
     default:
       return {
         eyebrow: t("upgrade.explore.eyebrow"),
@@ -292,9 +310,11 @@ interface UpgradeDialogProps {
   billing: UpgradeBilling | null | undefined;
   /** Where the prompt was shown, for analytics. */
   source: string;
+  /** A page on this site checkout returns to (a free preview project); Settings otherwise. */
+  returnTo?: string;
 }
 
-export function UpgradeDialog({ open, onOpenChange, reason, billing, source }: UpgradeDialogProps) {
+export function UpgradeDialog({ open, onOpenChange, reason, billing, source, returnTo }: UpgradeDialogProps) {
   const text = useBillingPlanText();
   const settings = useTranslations("settings");
   const state = getUpgradeState(billing);
@@ -335,7 +355,7 @@ export function UpgradeDialog({ open, onOpenChange, reason, billing, source }: U
     if (!target) return;
     setIsRedirecting(true);
     try {
-      await startUpgrade(target.id, `${source}:${reason.kind}`, billingInterval);
+      await startUpgrade(target.id, `${source}:${reason.kind}`, billingInterval, returnTo);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : text.t("checkoutError"));
       setIsRedirecting(false);
@@ -455,6 +475,10 @@ function preferredPlan(reason: UpgradeReason, options: PublicBillingPlan[]): Bil
     const fits = options.find((plan) => plan.youtubeMaxMinutes * 60 >= reason.durationSeconds);
     if (fits) return fits.id;
   }
+  if (reason.kind === "agent") {
+    const creator = options.find((plan) => plan.id === "scale");
+    if (creator) return creator.id;
+  }
   return (options.find((plan) => plan.highlighted) ?? options[0])?.id;
 }
 
@@ -568,7 +592,7 @@ function PlanOption({
   );
 }
 
-/** The right-hand panel: an illustration for why the prompt opened, plus what the plan includes. */
+/** The right-hand panel: a reason-specific illustration or a live moving collage of real clips. */
 function PlanShowcase({
   reason,
   plan,
@@ -579,53 +603,105 @@ function PlanShowcase({
   currentPlan: PublicBillingPlan | undefined;
 }) {
   const text = useBillingPlanText();
-  return (
-    <div className="hidden flex-col border-l bg-muted/50 p-8 sm:flex">
-      <div className="flex flex-1 flex-col justify-center">
-        {plan &&
-          (reason.kind === "video_too_long" ? (
-            <LengthIllustration
-              durationSeconds={reason.durationSeconds}
-              currentLimitSeconds={reason.maxSeconds}
-              nextLimitSeconds={plan.youtubeMaxMinutes * 60}
-              durationLabel={text.formatRuntime(reason.durationSeconds)}
-              currentLabel={`${currentPlan ? text.planName(currentPlan.id) : text.t("illustration.today")} · ${text.formatMinutes(Math.round(reason.maxSeconds / 60))}`}
-              nextLabel={`${text.planName(plan.id)} · ${text.formatMinutes(plan.youtubeMaxMinutes)}`}
-            />
-          ) : reason.kind === "custom_fonts" ? (
-            <FontIllustration />
-          ) : (
-            <CapacityIllustration
-              key={plan.id}
-              from={currentPlan ? currentPlan.minuteLimit / 60 : 0}
-              to={plan.minuteLimit / 60}
-              label={
-                currentPlan
-                  ? text.t("illustration.hoursUpFrom", { count: currentPlan.minuteLimit / 60 })
-                  : text.t("illustration.hoursWith", { plan: text.planName(plan.id) })
-              }
-            />
-          ))}
-      </div>
+  const isSpecificIllustration = reason.kind === "video_too_long" || reason.kind === "custom_fonts";
 
-      {plan && (
-        <ul className="mt-8 space-y-2 border-t pt-5">
-          {text.highlights(plan).map((highlight) => (
-            <li key={highlight} className="flex items-start gap-2 text-sm">
+  if (reason.kind === "agent") {
+    return (
+      <div className="hidden flex-col justify-center border-l bg-muted/50 p-6 sm:flex">
+        <div className="overflow-hidden rounded-2xl border bg-canvas shadow-[0_24px_60px_-36px_rgb(28_25_23/0.5)]">
+          <AgentFilm active />
+        </div>
+        <ul className="mt-6 space-y-2 border-t pt-5">
+          {[0, 1, 2].map((perk) => (
+            <li key={perk} className="flex items-start gap-2 text-sm">
               <Check className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-              {highlight}
+              {text.t(`upgrade.agent.perks.${perk}`)}
             </li>
           ))}
-          {text.comingSoon(plan) && (
-            <li className="flex items-start gap-2 text-sm text-muted-foreground">
-              <Clock className="mt-0.5 size-3.5 shrink-0" />
-              <span>
-                {text.comingSoon(plan)} <ComingSoonTag />
-              </span>
-            </li>
-          )}
         </ul>
+      </div>
+    );
+  }
+
+  if (isSpecificIllustration) {
+    return (
+      <div className="hidden flex-col border-l bg-muted/50 p-8 sm:flex">
+        <div className="flex flex-1 flex-col justify-center">
+          {plan &&
+            (reason.kind === "video_too_long" ? (
+              <LengthIllustration
+                durationSeconds={reason.durationSeconds}
+                currentLimitSeconds={reason.maxSeconds}
+                nextLimitSeconds={plan.youtubeMaxMinutes * 60}
+                durationLabel={text.formatRuntime(reason.durationSeconds)}
+                currentLabel={`${currentPlan ? text.planName(currentPlan.id) : text.t("illustration.today")} · ${text.formatMinutes(Math.round(reason.maxSeconds / 60))}`}
+                nextLabel={`${text.planName(plan.id)} · ${text.formatMinutes(plan.youtubeMaxMinutes)}`}
+              />
+            ) : (
+              <FontIllustration />
+            ))}
+        </div>
+
+        {plan && (
+          <ul className="mt-8 space-y-2 border-t pt-5">
+            {text.highlights(plan).map((highlight) => (
+              <li key={highlight} className="flex items-start gap-2 text-sm">
+                <Check className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+                {highlight}
+              </li>
+            ))}
+            {text.comingSoon(plan) && (
+              <li className="flex items-start gap-2 text-sm text-muted-foreground">
+                <Clock className="mt-0.5 size-3.5 shrink-0" />
+                <span>
+                  {text.comingSoon(plan)} <ComingSoonTag />
+                </span>
+              </li>
+            )}
+          </ul>
+        )}
+      </div>
+    );
+  }
+
+  const hoursLabel = plan
+    ? currentPlan
+      ? text.t("illustration.hoursUpFrom", { count: currentPlan.minuteLimit / 60 })
+      : text.t("illustration.hoursWith", { plan: text.planName(plan.id) })
+    : null;
+  // Monthly hours are already the headline above, so keep the compact summary focused on the rest.
+  const compactHighlights = plan ? text.highlights(plan).slice(1) : [];
+
+  return (
+    <div className="hidden flex-col overflow-hidden border-l bg-muted/50 sm:flex">
+      {plan && (
+        <div className="shrink-0 px-6 pb-3 pt-6">
+          <div className="flex items-baseline gap-2.5 pr-8">
+            <p className="font-display text-4xl font-bold leading-none tracking-tight tabular-nums">
+              <CountUp key={plan.id} from={currentPlan ? currentPlan.minuteLimit / 60 : 0} to={plan.minuteLimit / 60} />
+            </p>
+            <p className="text-sm leading-snug text-muted-foreground">{hoursLabel}</p>
+          </div>
+          <ul className="mt-2.5 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+            {compactHighlights.map((highlight) => (
+              <li key={highlight} className="inline-flex items-center gap-1">
+                <Check className="size-3 shrink-0 text-foreground/70" />
+                <span>{highlight}</span>
+              </li>
+            ))}
+            {text.comingSoon(plan) && (
+              <li className="inline-flex items-center gap-1">
+                <Clock className="size-3 shrink-0" />
+                <span>
+                  {text.comingSoon(plan)} <ComingSoonTag />
+                </span>
+              </li>
+            )}
+          </ul>
+        </div>
       )}
+
+      <UpgradeExamplesGallery className="min-h-[340px]" />
     </div>
   );
 }

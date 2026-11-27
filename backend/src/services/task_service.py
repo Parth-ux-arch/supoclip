@@ -57,6 +57,7 @@ from ..ai import TRANSCRIPT_ANALYSIS_CACHE_VERSION
 from ..clip_source_map import load_clip_caption_settings, normalize_source_ranges, source_range_bounds
 from ..media.timeline import seconds_to_mmss
 from ..workflows.boundaries import cleanup_key
+from ..onboarding.preview import is_locked_preview, locked_moments, mark_preview_used, pick_preview
 from ..workflows.contracts import OUTLINE_VERSION, WorkflowSpec, workflow_spec_from_task
 from ..workflows.errors import WorkflowError
 from ..media_storage import MediaStorage, media_work
@@ -385,9 +386,13 @@ class TaskService(ClipEditingMixin):
         edit_style: Optional[Dict[str, Any]] = None,
         idempotency: Optional[tuple[str, str]] = None,
         team_id: Optional[str] = None,
+        preview: bool = False,
+        source_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Create a new task with associated source.
+
+        ``preview``: a free preview project (onboarding/preview.py). It is never charged.
         Returns the task ID.
 
         With ``idempotency`` (key, request hash), raises ``TaskIdempotencyReplay``
@@ -446,12 +451,14 @@ class TaskService(ClipEditingMixin):
                 include_broll=include_broll,
                 processing_mode=processing_mode,
                 source_duration_seconds=source_duration_seconds,
-                charge_minutes=self.config.monetization_enabled,
+                charge_minutes=self.config.monetization_enabled and not preview,
                 workflow=workflow,
                 workflow_options=workflow_options,
                 **({"edit_style": edit_style} if edit_style else {}),
                 **({"idempotency": idempotency} if idempotency else {}),
                 **({"team_id": team_id} if team_id else {}),
+                **({"preview": {"status": "pending"}} if preview else {}),
+                **({"source_metadata": source_metadata} if source_metadata else {}),
             )
         except TaskIdempotencyReplay:
             # The task insert rolled back. Drop the source made for it.
@@ -571,7 +578,8 @@ class TaskService(ClipEditingMixin):
             prior_outputs = bool(await self.clip_repo.get_clips_by_task(self.db, task_id))
             # New tasks already have an atomic acceptance charge. Recover queued
             # legacy jobs with missing durations before doing paid processing.
-            if self.config.monetization_enabled and user_id:
+            # A free preview is never charged (onboarding/preview.py); unlocking it charges first.
+            if self.config.monetization_enabled and user_id and not is_locked_preview(task_row):
                 async with generation_allowance_guard(
                     self.db,
                     user_id,
@@ -766,6 +774,16 @@ class TaskService(ClipEditingMixin):
 
             # Render clips incrementally: render, save, notify one at a time
             segments_to_render = result.get("segments_to_render", [])
+            # A free preview renders only its best clip; the others are listed, locked.
+            preview_index: Optional[int] = None
+            if is_locked_preview(task_row) and segments_to_render:
+                preview_index = pick_preview(segments_to_render)
+                async with self._processing_transaction(task_id):
+                    await self.task_repo.merge_preview(self.db, task_id, {
+                        "found": len(segments_to_render),
+                        "rendered_position": preview_index + 1,
+                        "locked": locked_moments(segments_to_render, preview_index),
+                    })
             if not segments_to_render:
                 await self.cache_repo.upsert_cache(
                     self.db,
@@ -804,7 +822,7 @@ class TaskService(ClipEditingMixin):
 
             video_path = Path(result["video_path"])
             time_map = await run_in_thread(load_time_map, video_path)
-            total_clips = len(segments_to_render)
+            total_clips = 1 if preview_index is not None else len(segments_to_render)
             clips_output_dir = Path(self.config.temp_dir) / "clips"
             clips_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -865,14 +883,17 @@ class TaskService(ClipEditingMixin):
                 await check_cancelled()
                 if i + 1 in completed_positions:
                     continue
+                if preview_index is not None and i != preview_index:
+                    continue
 
                 # Update progress: 70-95% spread across clips
+                shown_index = 1 if preview_index is not None else i + 1
                 clip_progress = 70 + int(
-                    ((i + 1) / total_clips) * 25
+                    (shown_index / total_clips) * 25
                 ) if total_clips > 0 else 95
                 await update_progress(
                     clip_progress,
-                    f"Creating {noun} {i + 1}/{total_clips}...",
+                    f"Creating {noun} {shown_index}/{total_clips}...",
                 )
 
                 # A partial download is a concatenated timeline. Render against
@@ -1003,6 +1024,10 @@ class TaskService(ClipEditingMixin):
                         self.db, task_id, [next_clip_ids[order] for order in sorted(next_clip_ids)]
                     )
                     await save_checkpoint({"completed_positions": sorted(completed_positions | {i + 1})})
+                    if preview_index is not None and user_id:
+                        # The free preview is used up by the clip it gives, in the same commit: a preview
+                        # cancelled or failing after this keeps its clip, and mustn't leave another free one.
+                        await mark_preview_used(self.db, user_id)
 
                     await check_cancelled()
                 pending_clip_path = None
@@ -1017,7 +1042,7 @@ class TaskService(ClipEditingMixin):
                         self.db, clip_id
                     )
                     if clip_record:
-                        await clip_ready_callback(i, total_clips, clip_record)
+                        await clip_ready_callback(shown_index - 1, total_clips, clip_record)
 
             stage_timings["render_seconds"] = round(
                 perf_counter() - render_start, 3

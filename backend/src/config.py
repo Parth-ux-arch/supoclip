@@ -51,6 +51,18 @@ class Config:
         self.assembly_ai_request_timeout_seconds = max(5, min(300, int(
             os.getenv("ASSEMBLY_AI_REQUEST_TIMEOUT_SECONDS", "60")
         )))
+        self.soniox_api_key = self._get_runtime_setting("SONIOX_API_KEY")
+        self.soniox_model = os.getenv("SONIOX_MODEL", "stt-async-v6").strip() or "stt-async-v6"
+        self.soniox_base_url = (
+            os.getenv("SONIOX_BASE_URL", "https://api.soniox.com").strip()
+            or "https://api.soniox.com"
+        ).rstrip("/")
+        self.soniox_http_timeout_seconds = max(30, min(7200, int(
+            os.getenv("SONIOX_HTTP_TIMEOUT_SECONDS", "900")
+        )))
+        self.soniox_request_timeout_seconds = max(5, min(300, int(
+            os.getenv("SONIOX_REQUEST_TIMEOUT_SECONDS", "60")
+        )))
         self.pexels_api_key = self._get_runtime_setting("PEXELS_API_KEY")
         self.apify_api_token = self._get_runtime_setting("APIFY_API_TOKEN")
         self.rapidapi_youtube_api_key = self._get_optional_env("RAPIDAPI_YOUTUBE_API_KEY")
@@ -125,11 +137,23 @@ class Config:
         self.team_youtube_max_video_duration = int(
             os.getenv("TEAM_YOUTUBE_MAX_VIDEO_DURATION", "10800")
         )
-        # 4 GB fits a full-length upload (two hours on Pro) at a
-        # normal 1080p bitrate. Larger files make transcription, storage, and
-        # rendering slow and fragile.
+        # Upload size cap without a paid plan, for self-hosted installs, and
+        # for the API-spooled `/upload` route (it writes to the API's own disk).
         self.max_video_upload_bytes = int(
             os.getenv("MAX_VIDEO_UPLOAD_BYTES", "4000000000")
+        )
+        # Paid plans upload straight to the bucket. Each cap fits a plan's
+        # longest video at about 66 Mbps, above a 4K60 phone or OBS recording,
+        # so the length limit is the one people meet. Sources above 1080p are
+        # scaled down before processing.
+        self.pro_max_video_upload_bytes = int(
+            os.getenv("PRO_MAX_VIDEO_UPLOAD_BYTES", "60000000000")
+        )
+        self.scale_max_video_upload_bytes = int(
+            os.getenv("SCALE_MAX_VIDEO_UPLOAD_BYTES", "90000000000")
+        )
+        self.team_max_video_upload_bytes = int(
+            os.getenv("TEAM_MAX_VIDEO_UPLOAD_BYTES", "90000000000")
         )
         self.output_dir = os.getenv("OUTPUT_DIR", "outputs")
 
@@ -398,6 +422,21 @@ class Config:
         # playing twice (teaser, then again inside the clip) and the opening
         # has to stand on its own. Set HOOK_FIRST_TEASER=true to opt back in.
         self.hook_first_teaser = self._get_bool_env("HOOK_FIRST_TEASER", False)
+        # After the moments are picked, one small model call checks where each clip opens and closes
+        # (an answer without its question, "he" with nobody named, a setup without its payoff) and may move
+        # an edge by a few sentences. Code validates every move. Off keeps the rule-based edges only.
+        self.clip_edge_review = self._get_bool_env("CLIP_EDGE_REVIEW", True)
+        # The model for that check. A few hundred tokens per clip, so the strongest model is cheap here and
+        # it is the one that decides whether a clip stands on its own: Claude Sonnet when an Anthropic key is
+        # set, else the rerank model, else LLM.
+        self.clip_edge_llm = self._get_optional_env("CLIP_EDGE_LLM") or (
+            "anthropic:claude-sonnet-5-5" if self.anthropic_api_key else None
+        )
+        # The local speech recogniser listens to the few seconds around each cut and corrects word times and
+        # sentence ends the transcript has wrong there (media/edge_listen.py). auto: only when the model
+        # file is already on the machine (the image bakes it in); on: load it, downloading if needed; off.
+        self.clip_edge_listen = (os.getenv("CLIP_EDGE_LISTEN") or "auto").strip().lower()
+        self.clip_edge_listen_model = (os.getenv("CLIP_EDGE_LISTEN_MODEL") or "small").strip()
         # Cut between speakers on multi-person wide shots using diarization.
         self.speaker_framing = self._get_bool_env("SPEAKER_FRAMING", True)
 
@@ -408,6 +447,50 @@ class Config:
         subscription_provider: str | None = None,
     ) -> int:
         """Return the per-video duration cap (any source) granted by an active entitlement."""
+        return self._plan_limit(
+            plan, subscription_status, subscription_provider,
+            default=self.max_video_duration,
+            pro=self.pro_youtube_max_video_duration,
+            scale=self.scale_youtube_max_video_duration,
+            team=self.team_youtube_max_video_duration,
+        )
+
+    def max_upload_bytes_for_plan(
+        self,
+        plan: str | None,
+        subscription_status: str | None,
+        subscription_provider: str | None = None,
+    ) -> int:
+        """Return the direct-upload size cap granted by an active entitlement."""
+        return self._plan_limit(
+            plan, subscription_status, subscription_provider,
+            default=self.max_video_upload_bytes,
+            pro=self.pro_max_video_upload_bytes,
+            scale=self.scale_max_video_upload_bytes,
+            team=self.team_max_video_upload_bytes,
+        )
+
+    @property
+    def upload_bytes_ceiling(self) -> int:
+        """Largest upload any plan allows; storage refuses anything bigger."""
+        return max(
+            self.max_video_upload_bytes,
+            self.pro_max_video_upload_bytes,
+            self.scale_max_video_upload_bytes,
+            self.team_max_video_upload_bytes,
+        )
+
+    @staticmethod
+    def _plan_limit(
+        plan: str | None,
+        subscription_status: str | None,
+        subscription_provider: str | None,
+        *,
+        default: int,
+        pro: int,
+        scale: int,
+        team: int,
+    ) -> int:
         status = (subscription_status or "").lower()
         provider = (subscription_provider or "").lower()
         # past_due keeps the cap only while Stripe is still retrying the invoice.
@@ -415,15 +498,8 @@ class Config:
             status == "past_due" and provider == "stripe"
         )
         if not entitled:
-            return self.max_video_duration
-
-        if (plan or "").lower() == "team":
-            return self.team_youtube_max_video_duration
-        if (plan or "").lower() == "scale":
-            return self.scale_youtube_max_video_duration
-        if (plan or "").lower() == "pro":
-            return self.pro_youtube_max_video_duration
-        return self.max_video_duration
+            return default
+        return {"team": team, "scale": scale, "pro": pro}.get((plan or "").lower(), default)
 
     def team_minute_limit_for_seats(self, seat_limit: int | None) -> int:
         """Pooled monthly minute allowance for a Team plan with `seat_limit` seats."""
@@ -453,6 +529,7 @@ class Config:
     def as_runtime_settings(self) -> dict[str, str | None]:
         return {
             "ASSEMBLY_AI_API_KEY": self.assembly_ai_api_key,
+            "SONIOX_API_KEY": self.soniox_api_key,
             "LLM": self.llm,
             "OPENAI_API_KEY": self.openai_api_key,
             "OPENROUTER_API_KEY": self.openrouter_api_key,
@@ -525,7 +602,7 @@ class Config:
     @staticmethod
     def _normalize_transcription_provider(value: str | None) -> str:
         normalized = (value or "").strip().lower().replace("-", "_")
-        if normalized in ("whisper", "youtube_captions"):
+        if normalized in ("soniox", "whisper", "youtube_captions"):
             return normalized
         return "assemblyai"
 

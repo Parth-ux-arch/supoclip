@@ -25,6 +25,8 @@ EventName = Literal[
     "task_failed",
     "clip_exported",
     "social_post_published",
+    # The account got Agent's guided onboarding, once, from the app it first opened (docs/onboarding.md).
+    "onboarding_assigned",
 ]
 
 Client = Literal["web", "ios", "api_key", "mcp"]

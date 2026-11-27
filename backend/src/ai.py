@@ -52,7 +52,12 @@ ANALYSIS_WINDOW_SEGMENT_TARGET = "3-5"
 # its own TRANSCRIPT_ANALYSIS_TIMEOUT_SECONDS budget once it starts running.
 ANALYSIS_TOTAL_TIMEOUT_SECONDS = 1800
 RERANK_TIMEOUT_SECONDS = 240
-CANDIDATE_DEDUPE_OVERLAP_RATIO = 0.5
+# Two clips of one video may share a little footage at their edges, not a third of the shorter one:
+# a viewer of both would watch the same moment twice.
+CANDIDATE_DEDUPE_OVERLAP_RATIO = 1 / 3
+# A pick that sits between two stronger ones can stay under that limit with each and still be mostly
+# footage they already show.
+CANDIDATE_DEDUPE_COVERED_RATIO = 0.5
 # How far a model timestamp may sit from a transcript line boundary and still be
 # snapped onto it instead of the whole clip being dropped.
 SEGMENT_SNAP_TOLERANCE_SECONDS = 8
@@ -98,6 +103,23 @@ def _parse_transcript_lines(transcript: str) -> List[Dict[str, Any]]:
             }
         )
     return lines
+
+
+def short_source_speech_bounds(
+    transcript: str, source_duration: float | None, clip_length: str,
+) -> tuple[int, int] | None:
+    """Return the spoken range when the source is already within the clip length cap."""
+    maximum = clip_duration(clip_length).maximum
+    if source_duration is None or not 0 < source_duration <= maximum:
+        return None
+    lines = [line for line in _parse_transcript_lines(transcript) if line["text"]]
+    if sum(len(line["text"].split()) for line in lines) < 3:
+        return None
+    start = min(line["start_seconds"] for line in lines)
+    end = max(line["end_seconds"] for line in lines)
+    if start < end <= math.ceil(source_duration):
+        return start, end
+    return None
 
 
 def _snap_bounds_to_transcript_lines(
@@ -431,7 +453,9 @@ SCORING AND OUTPUT RULES:
 - virality_reasoning and reasoning should cite what is actually present in the chosen span
 - summary and key_topics must also stay grounded in the transcript and should not add outside interpretation
 
-Find the number of compelling segments requested in the task (usually 2-5) that would work well as standalone clips. Quality over quantity: choose fewer stronger segments over filling a quota. Every selected segment must be accurate, self-contained, have proper time ranges, and score high on virality metrics."""
+Find the number of compelling segments requested in the task (usually 2-5) that would work well as standalone clips. Quality over quantity: choose fewer stronger segments over filling a quota. Every selected segment must be accurate, self-contained, have proper time ranges, and score high on virality metrics.
+
+When the task identifies an already-short source, follow its selection target and feasible duration range. Evaluate the speech that is actually available, even if the source begins or ends in the middle of a longer exchange. A modest virality score is valid for an otherwise usable short selection."""
 
 def build_transcript_system_prompt(clip_length: str = "auto") -> str:
     bounds = clip_duration(clip_length)
@@ -717,6 +741,155 @@ def get_rerank_agent() -> Agent[None, CandidateRanking]:
     return _rerank_agent
 
 
+class ClipEdges(BaseModel):
+    """Where one clip should open and close, as sentence ids from the lists it was shown."""
+
+    clip: int = Field(description="The clip number as given")
+    opening_problem: str = Field(
+        description="What is wrong with the current opening: none, answers_unseen_line, unnamed_reference, "
+                    "continues_earlier_point, leftover, or mid_sentence")
+    closing_problem: str = Field(
+        description="What is wrong with the current closing: none, unanswered_question, missing_payoff, "
+                    "next_topic, or fragment")
+    opening_id: int = Field(description="Id of the sentence the clip opens on, from its OPENING list")
+    closing_id: int = Field(description="Id of the sentence the clip closes on, from its CLOSING list")
+
+
+class ClipEdgeReview(BaseModel):
+    """Opening and closing sentence for every clip in the request."""
+
+    clips: List[ClipEdges] = Field(description="One entry per clip, in the order given")
+
+
+clip_edge_system_prompt = """You are a short-form video editor checking where a clip starts and ends. A viewer sees only the clip: nothing that was said before it, nothing that is said after it.
+
+The clip was cut from a longer video on whole sentences. You get what the clip is about (its title and why it was picked), then numbered sentences around its current first sentence (OPENING) and around its current last sentence (CLOSING), in the order they are spoken, with the speaker when known. Sentences marked "in clip" are currently part of the clip; the others are just before or just after it. First name what is wrong with each edge, then choose the sentence the clip should open on and the sentence it should close on.
+
+OPENING. The first sentence a viewer hears must make sense on its own and belong to what the clip is about. Problems, and the fix:
+- answers_unseen_line: it answers, echoes or reacts to a line that is not in the clip (a bare reply, a question that repeats what somebody just said, "that is what I mean"). Open on that line.
+- unnamed_reference: it points at someone or something only an earlier sentence names ("he", "she", "they", "their", "it", "that", "in there", "this guy") and the clip's first two sentences never say who or what. Open on the nearest earlier sentence that names it.
+- continues_earlier_point: it starts with a connector that carries on an earlier point ("but", "so", "because", "and then", "which", "that is", and their equivalents in the clip's language) and does not make sense without that point. Open on the sentence it continues.
+- leftover: the first sentence or two belong to the topic before, or are a scrap of it (a bare agreement, a laugh, filler, the end of another story), and what the clip is about starts after them. Open on the sentence where the clip's own subject starts.
+- mid_sentence: it is the second half of a sentence whose first half is just before it. Open on the first half.
+
+CLOSING. The last sentence must finish the thought the clip is about. Problems, and the fix:
+- unanswered_question: it is a question, or a line said to somebody, and the answer or reply follows (a short reply by the other person counts). Close on the answer.
+- missing_payoff: the clip builds to something (what the title promises, a reveal, a punchline, the result of an attempt, a count such as "one..." with "two" right after) and it is said in the sentences that follow. Close on the sentence that delivers it.
+- next_topic: it only announces the next topic, thanks the viewer or asks them to subscribe. Close one sentence earlier.
+- fragment: it is a trailing fragment that is not a finished thought. Close one sentence earlier, or on the sentence that finishes it.
+
+Rules:
+- Make the smallest change that fixes the problem. Never open earlier or close later than needed, and never open on a sentence that itself needs earlier context when a nearby one stands alone.
+- Do not add sentences that start a new, unrelated thought.
+- Use only ids from the clip's own lists: opening_id from OPENING, closing_id from CLOSING.
+- When an edge has no problem, say "none" and return its current id. Many clips need no change; do not move an edge that is fine.
+- Judge only what the sentences say. Stay content-neutral.
+- Return valid JSON only, with a "clips" list holding one entry per clip."""
+
+CLIP_EDGE_TIMEOUT_SECONDS = 60
+CLIP_EDGE_CONCURRENCY = 4
+
+_edge_agent: Optional[Agent[None, ClipEdgeReview]] = None
+_edge_agent_signature: Optional[tuple[str | None, ...]] = None
+
+
+def get_clip_edge_agent() -> Agent[None, ClipEdgeReview]:
+    """Get or create the clip-edge review agent (lazy initialization)."""
+    global _edge_agent, _edge_agent_signature
+    runtime_config = get_config()
+    model_name = (getattr(runtime_config, "clip_edge_llm", None)
+                  or getattr(runtime_config, "rerank_llm", None) or runtime_config.llm)
+    signature = (
+        model_name,
+        runtime_config.openai_api_key,
+        runtime_config.openrouter_api_key,
+        runtime_config.openrouter_fallback_model,
+        runtime_config.google_api_key,
+        runtime_config.anthropic_api_key,
+        getattr(runtime_config, "bedrock_api_key", None),
+        getattr(runtime_config, "aws_region", None),
+        runtime_config.ollama_base_url,
+        runtime_config.ollama_api_key,
+    )
+    if _edge_agent is None or _edge_agent_signature != signature:
+        apply_settings_to_process_env(runtime_config.as_runtime_settings())
+        config_error = _get_missing_llm_key_error(model_name, runtime_config)
+        if config_error:
+            raise RuntimeError(config_error)
+        _edge_agent = Agent[None, ClipEdgeReview](
+            model=_build_transcript_model(runtime_config, model_name),
+            output_type=NativeOutput(ClipEdgeReview, strict=True) if _uses_native_output(model_name) else ClipEdgeReview,
+            system_prompt=clip_edge_system_prompt,
+            output_retries=2,
+        )
+        _edge_agent_signature = signature
+    return _edge_agent
+
+
+def build_clip_edge_prompt(clips: List[Dict[str, Any]]) -> str:
+    """The request for ``review_clip_edges``: per clip what it is about and the two sentence lists.
+
+    Each clip is ``{"clip": n, "title": str, "about": str, "opening": [...], "closing": [...], "first": id, "last": id}``
+    with sentences as ``{"id": int, "speaker": str | None, "text": str, "in_clip": bool}``.
+    """
+    def listing(sentences: List[Dict[str, Any]]) -> str:
+        lines = []
+        for sentence in sentences:
+            speaker = f"[{sentence['speaker']}] " if sentence.get("speaker") else ""
+            mark = " (in clip)" if sentence.get("in_clip") else ""
+            lines.append(f"#{sentence['id']}{mark} {speaker}{sentence['text']}")
+        return "\n".join(lines)
+
+    parts = []
+    for clip in clips:
+        about = "".join(
+            f"{label}: {clip[key]}\n" for label, key in (("Title", "title"), ("Why it was picked", "about"))
+            if clip.get(key)
+        )
+        parts.append(
+            f"CLIP {clip['clip']}\n{about}"
+            f"OPENING sentences (current opening: #{clip['first']}):\n{listing(clip['opening'])}\n"
+            f"CLOSING sentences (current closing: #{clip['last']}):\n{listing(clip['closing'])}"
+        )
+    return "Check these clips and return the opening and closing sentence id for each.\n\n" + "\n\n".join(parts)
+
+
+async def review_clip_edges(clips: List[Dict[str, Any]]) -> Dict[int, tuple[int, int]]:
+    """Ask the model where each clip should open and close: {clip number: (opening id, closing id)}.
+
+    One small call per clip, a few at a time: asked about a dozen clips at once the model waves them all
+    through. A clip whose call fails is left out (its resolved edges stand); ids outside a clip's own lists
+    are dropped here, everything else (sentence starts, durations) is checked by the caller.
+    """
+    if not clips:
+        return {}
+    try:
+        agent = get_clip_edge_agent()
+    except Exception as error:
+        logger.warning("Clip edge review unavailable (%s); keeping the resolved edges", type(error).__name__)
+        return {}
+    gate = asyncio.Semaphore(CLIP_EDGE_CONCURRENCY)
+
+    async def review(clip: Dict[str, Any]) -> Optional[tuple[int, int]]:
+        async with gate:
+            try:
+                result = await _run_transcript_analysis(
+                    agent, build_clip_edge_prompt([clip]), timeout_seconds=CLIP_EDGE_TIMEOUT_SECONDS)
+            except Exception as error:
+                # Do not log the error text: provider bodies may contain transcript data.
+                logger.warning("Clip edge review failed (%s); keeping the resolved edges", type(error).__name__)
+                return None
+        opening = {sentence["id"] for sentence in clip["opening"]}
+        closing = {sentence["id"] for sentence in clip["closing"]}
+        for item in result.output.clips:
+            if item.opening_id in opening and item.closing_id in closing:
+                return item.opening_id, item.closing_id
+        return None
+
+    answers = await asyncio.gather(*(review(clip) for clip in clips))
+    return {clip["clip"]: answer for clip, answer in zip(clips, answers) if answer is not None}
+
+
 class BRollCue(BaseModel):
     """One stock-footage cutaway inside a finished clip."""
 
@@ -871,15 +1044,17 @@ def build_transcript_analysis_prompt(
     clip_length: str = "auto",
     *,
     instructions: str | None = None,
+    short_speech_bounds: tuple[int, int] | None = None,
 ) -> str:
     """Build the grounded task prompt for transcript analysis.
 
     ``window`` marks the prompt as one (start, end) slice of a longer source.
     ``performance_context`` is the creator's measured audience history, if any.
-    ``instructions`` (the creator's steering text) goes just before the
-    transcript; without it the prompt is unchanged.
+    ``short_speech_bounds`` describes the spoken extent of an already-short source.
+    ``instructions`` (the creator's steering text) goes just before the transcript.
     """
     bounds = clip_duration(clip_length)
+    minimum = bounds.minimum
     segment_target = ANALYSIS_WINDOW_SEGMENT_TARGET if window else "2-5"
     window_note = ""
     if window:
@@ -898,6 +1073,34 @@ def build_transcript_analysis_prompt(
             "must still be a coherent contiguous transcript range."
         )
     instructions_section = f"{instructions_block(instructions)}\n\n" if instructions else ""
+    boundary_guidance = (
+        "start_time must be the first word of a self-contained sentence: never a mid-thought fragment, "
+        "a filler, a bare agreement, or a reference to something this clip does not contain. "
+        "end_time must finish that thought's last sentence and must not include the next thought's opening words."
+    )
+    selection_guidance = f"""- Return fewer segments when the transcript lacks enough distinct, self-contained moments; the target is not a quota.
+- Most selected clips should be {bounds.ideal_minimum}-{bounds.ideal_maximum} seconds.
+- Every clip must contain a full setup and payoff within {bounds.minimum}-{bounds.maximum} seconds.
+- If a strong moment is shorter than {bounds.ideal_minimum} seconds, first try expanding to nearby contiguous transcript lines that add useful context.
+- Skip weak standalone picks: intros, sponsor reads, CTAs, contextless quotes, repeated points, vague setup, and answer fragments that require prior context.
+- Before returning a segment, ask whether a viewer would understand and care without seeing the rest of the source video."""
+    if short_speech_bounds is not None and window is None:
+        start, end = short_speech_bounds
+        minimum = min(minimum, end - start)
+        segment_target = "1-2"
+        boundary_guidance = (
+            "Prefer natural openings and endings. If the source begins or ends during an exchange, "
+            "use the available boundaries when the exchange is still understandable."
+        )
+        selection_guidance = (
+            "- The source is already a short clip. Pick its best spoken moment, or use the full "
+            f"spoken range ({_format_minutes_label(start)} to {_format_minutes_label(end)}) "
+            "when it works best together.\n"
+            "- Use the context available in the clip. A quick reaction, exchange, or observation "
+            "can work without a long-form setup and payoff.\n"
+            "- Include a grounded hook_title and score what the clip actually offers. "
+            "Return at least one usable selection when the speech is clear, even at a modest score."
+        )
 
     return f"""Analyze this video transcript and identify the most engaging segments for short-form content.
 {window_note}
@@ -910,16 +1113,11 @@ Follow this workflow:
 2. Select only contiguous ranges that already exist in the transcript.
 3. Prefer moments with a strong hook, clear payoff, emotional charge, or concrete value.
 4. For each chosen segment, use the earliest timestamp in the selected range as start_time and the latest timestamp in the selected range as end_time.
-5. start_time must be the first word of a self-contained sentence: never a mid-thought fragment, a filler, a bare agreement, or a reference to something this clip does not contain. end_time must finish that thought's last sentence and must not include the next thought's opening words.
+5. {boundary_guidance}
 
 Selection target:
 - Choose {segment_target} segments total.
-- Return fewer segments when the transcript lacks enough distinct, self-contained moments; the target is not a quota.
-- Most selected clips should be {bounds.ideal_minimum}-{bounds.ideal_maximum} seconds.
-- Every clip must contain a full setup and payoff within {bounds.minimum}-{bounds.maximum} seconds.
-- If a strong moment is shorter than {bounds.ideal_minimum} seconds, first try expanding to nearby contiguous transcript lines that add useful context.
-- Skip weak standalone picks: intros, sponsor reads, CTAs, contextless quotes, repeated points, vague setup, and answer fragments that require prior context.
-- Before returning a segment, ask whether a viewer would understand and care without seeing the rest of the source video.
+{selection_guidance}
 
 Critical accuracy requirements:
 - Do not fabricate or embellish content.
@@ -939,7 +1137,7 @@ JSON-only output requirements:
 - Optional segment keys "hook_start_time"/"hook_end_time": null unless a later 2-5 second line stands alone and the real opening is already a complete setup. The clip is not replayed from that line by default.
 - "hook_title" is a 3-9 word plain-text headline grounded in the segment. Use Latin-script Hinglish for Hindi or Hinglish speech, English for English speech (no hashtags, emojis, or quotes).
 - Virality keys: "hook_score", "engagement_score", "value_score", "shareability_score", "total_score", "hook_type", "virality_reasoning".
-- Do not return segments shorter than {bounds.minimum} seconds or longer than {bounds.maximum} seconds.
+- Do not return segments shorter than {minimum} seconds or longer than {bounds.maximum} seconds.
 
 {instructions_section}Transcript:
 {transcript}"""
@@ -1441,6 +1639,20 @@ def _overlap_ratio(first: tuple[int, int], second: tuple[int, int]) -> float:
     return max(0, overlap) / shorter
 
 
+def _covered_ratio(bounds: tuple[int, int], others: List[tuple[int, int]]) -> float:
+    """Share of ``bounds`` that the other ranges, taken together, already show."""
+    start, end = bounds
+    if end <= start:
+        return 0.0
+    covered, cursor = 0, start
+    for other_start, other_end in sorted(others):
+        low, high = max(other_start, cursor), min(other_end, end)
+        if high > low:
+            covered += high - low
+            cursor = high
+    return covered / (end - start)
+
+
 def dedupe_overlapping_segments(
     segments: List[TranscriptSegment],
     max_overlap_ratio: float = CANDIDATE_DEDUPE_OVERLAP_RATIO,
@@ -1455,7 +1667,7 @@ def dedupe_overlapping_segments(
         if any(
             _overlap_ratio(bounds, kept_bounds) > max_overlap_ratio
             for _, kept_bounds in kept
-        ):
+        ) or _covered_ratio(bounds, [kept_bounds for _, kept_bounds in kept]) > CANDIDATE_DEDUPE_COVERED_RATIO:
             logger.info(
                 "Dropping overlapping candidate %s-%s", segment.start_time, segment.end_time
             )
@@ -1684,9 +1896,15 @@ def _validate_segments(
     transcript_lines: List[Dict[str, Any]],
     transcript_spans: List[Dict[str, Any]],
     clip_length: str = "auto",
+    *,
+    short_speech_bounds: tuple[int, int] | None = None,
 ) -> List[TranscriptSegment]:
     """Ground model segments onto real transcript lines and drop unusable ones."""
     bounds = clip_duration(clip_length)
+    minimum = bounds.minimum
+    if short_speech_bounds is not None:
+        first_speech, last_speech = short_speech_bounds
+        minimum = min(minimum, last_speech - first_speech)
     validated_segments: List[TranscriptSegment] = []
     for segment in segments:
         # Validate text content
@@ -1707,12 +1925,18 @@ def _validate_segments(
         try:
             start_seconds = _parse_transcript_timestamp_seconds(segment.start_time)
             end_seconds = _parse_transcript_timestamp_seconds(segment.end_time)
+            if short_speech_bounds is not None:
+                # Whole-source picks can include silence outside the transcript labels.
+                start_seconds = max(start_seconds, first_speech)
+                end_seconds = min(end_seconds, last_speech)
+            if end_seconds <= start_seconds:
+                continue
             start_seconds, end_seconds = _snap_segment_bounds(
                 segment, transcript_lines, start_seconds, end_seconds
             )
             duration = end_seconds - start_seconds
 
-            if duration < bounds.minimum or duration > bounds.maximum:
+            if duration < minimum or duration > bounds.maximum:
                 repaired_bounds = _repair_segment_bounds(
                     segment,
                     transcript_spans,
@@ -1733,9 +1957,9 @@ def _validate_segments(
                 )
                 continue
 
-            if duration < bounds.minimum:
+            if duration < minimum:
                 logger.warning(
-                    f"Skipping segment too short: {duration}s (min {bounds.minimum}s required)"
+                    f"Skipping segment too short: {duration}s (min {minimum}s required)"
                 )
                 continue
 
@@ -1825,10 +2049,11 @@ async def get_most_relevant_parts_by_transcript(
     include_reserve: bool = False,
     *,
     instructions: str | None = None,
+    source_duration: float | None = None,
 ) -> TranscriptAnalysis:
     """Get the most relevant parts of a transcript with virality scoring.
 
-    Short transcripts are analysed in one call. Long ones are split into
+    Short transcripts are normally analysed in one call. Long ones are split into
     overlapping windows analysed concurrently, then deduplicated and reranked
     in one comparative call so scores are comparable across windows.
     ``instructions`` (the creator's steering text) reaches every user prompt
@@ -1844,18 +2069,18 @@ async def get_most_relevant_parts_by_transcript(
         transcript_lines = _parse_transcript_lines(transcript)
         transcript_spans = _parse_transcript_spans(transcript)
         windows = split_transcript_into_windows(transcript)
+        short_speech_bounds = short_source_speech_bounds(transcript, source_duration, clip_length)
 
         if len(windows) == 1:
-            result = await _run_transcript_analysis(
-                agent,
-                build_transcript_analysis_prompt(
-                    transcript=transcript,
-                    clip_signals=clip_signals,
-                    performance_context=performance_context,
-                    clip_length=clip_length,
-                    **steering,
-                )
+            prompt = build_transcript_analysis_prompt(
+                transcript=transcript,
+                clip_signals=clip_signals,
+                performance_context=performance_context,
+                clip_length=clip_length,
+                short_speech_bounds=short_speech_bounds,
+                **steering,
             )
+            result = await _run_transcript_analysis(agent, prompt)
             analyses = [result.output]
         else:
             logger.info("Analysing transcript in %d overlapping windows", len(windows))
@@ -1870,9 +2095,29 @@ async def get_most_relevant_parts_by_transcript(
             )
             candidates.extend(
                 _validate_segments(
-                    analysis.most_relevant_segments, transcript_lines, transcript_spans, clip_length
+                    analysis.most_relevant_segments, transcript_lines, transcript_spans, clip_length,
+                    short_speech_bounds=short_speech_bounds,
                 )
             )
+
+        if not candidates and short_speech_bounds is not None and len(windows) == 1:
+            logger.info("Retrying short-source analysis after no usable selections")
+            try:
+                result = await _run_transcript_analysis(
+                    agent,
+                    prompt + "\n\nThe first pass yielded no usable selection. Evaluate the full spoken range "
+                    "above as one candidate. Use its transcript boundaries, give it a grounded hook_title, "
+                    "and score it on the actual speech, even if it earns a modest score.",
+                )
+            except Exception as exc:
+                logger.warning("Short-source analysis retry failed (%s)", type(exc).__name__)
+            else:
+                candidates = _validate_segments(
+                    result.output.most_relevant_segments, transcript_lines, transcript_spans, clip_length,
+                    short_speech_bounds=short_speech_bounds,
+                )
+                if candidates:
+                    analyses = [result.output]
 
         # Best-first by virality (primary) then relevance (secondary), without
         # near-duplicates; then compare across windows in one rerank call.

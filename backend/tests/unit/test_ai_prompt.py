@@ -74,6 +74,20 @@ def test_clip_selection_prompts_never_ask_for_broll():
     assert "b-roll" not in build_transcript_system_prompt("auto").lower()
 
 
+def test_short_source_prompt_prefers_a_usable_spoken_moment_and_a_grounded_title():
+    transcript = "[00:02 - 00:20] The shortcut saved us a full hour."
+    prompt = build_transcript_analysis_prompt(
+        transcript, clip_length="medium", short_speech_bounds=(2, 20),
+    )
+
+    assert "source is already a short clip" in prompt
+    assert "Choose 1-2 segments total" in prompt
+    assert "full spoken range (00:02 to 00:20)" in prompt
+    assert "grounded hook_title" in prompt
+    assert "shorter than 18 seconds or longer than 60 seconds" in prompt
+    assert "must contain a full setup and payoff" not in prompt
+
+
 def test_ollama_llm_builds_native_ollama_model():
     runtime_config = SimpleNamespace(
         llm="ollama:gpt-oss:20b",
@@ -138,6 +152,45 @@ def test_llm_validation_rejects_unsupported_or_incomplete_model_names():
         "ollama:", runtime_config
     )
     assert _get_missing_llm_key_error("ollama:gpt-oss:20b", runtime_config) is None
+
+
+def test_bedrock_validation_model_and_agent_cache_invalidation(monkeypatch):
+    from pydantic_ai.models.openai import OpenAIChatModel
+
+    cfg = SimpleNamespace(
+        llm="bedrock:global.moonshotai.kimi-k3.1",
+        rerank_llm=None,
+        clip_edge_llm=None,
+        openai_api_key=None,
+        openrouter_api_key=None,
+        openrouter_fallback_model="openai/gpt-6-luna",
+        google_api_key=None,
+        anthropic_api_key=None,
+        bedrock_api_key=None,
+        aws_region="ap-south-1",
+        ollama_base_url=None,
+        ollama_api_key=None,
+        as_runtime_settings=lambda: {},
+    )
+    assert "AWS_BEARER_TOKEN_BEDROCK" in _get_missing_llm_key_error(cfg.llm, cfg)
+
+    cfg.bedrock_api_key = "test-bedrock-token"
+    assert _get_missing_llm_key_error(cfg.llm, cfg) is None
+    model = ai_module._build_transcript_model(cfg)
+    assert isinstance(model, OpenAIChatModel)
+    assert "bedrock-runtime.ap-south-1.amazonaws.com/openai/v1" in str(model._provider.base_url)
+
+    monkeypatch.setattr(ai_module, "get_config", lambda: cfg)
+    monkeypatch.setattr(ai_module, "_transcript_agent", None)
+    monkeypatch.setattr(ai_module, "_transcript_agent_signature", None)
+    monkeypatch.setattr(ai_module, "_edge_agent", None)
+    monkeypatch.setattr(ai_module, "_edge_agent_signature", None)
+
+    first_t = ai_module.get_transcript_agent()
+    first_e = ai_module.get_clip_edge_agent()
+    cfg.bedrock_api_key = "rotated-bedrock-token"
+    assert ai_module.get_transcript_agent() is not first_t
+    assert ai_module.get_clip_edge_agent() is not first_e
 
 
 # -- highlights with instructions (workflows) ---------------------------------------

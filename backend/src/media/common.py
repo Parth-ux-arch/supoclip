@@ -82,6 +82,9 @@ CLIP_END_NEXT_WORD_GUARD_SECONDS = 0.03
 # clicks. Short enough that it never softens the last word's final consonant.
 CLIP_END_AUDIO_FADE_SECONDS = 0.025
 
+# The same at the clip's first moment, shorter: it must not soften the first consonant.
+CLIP_START_AUDIO_FADE_SECONDS = 0.012
+
 # When the duration cap lands mid-sentence, the end may back off this share of
 # the cap (at least 3s) to the previous sentence end instead of cutting mid-thought.
 CLIP_CAP_SENTENCE_BACKOFF_FRACTION = 0.25
@@ -166,6 +169,17 @@ OUTPUT_FPS = 30
 AUDIO_BITRATE = "192k"
 
 LOUDNORM_FILTER = "loudnorm=I=-14:TP=-1.5:LRA=11"
+
+# One-pass loudnorm only aims at its true-peak target: a scream or a laugh after a quiet stretch, and the AAC
+# encoder after it (it rings on clipped, full-band audio), measured up to +2 dBFS on a rendered clip. The guard
+# runs after loudnorm at the output rate: the top octave the encoder would cut anyway is cut first, so it has
+# nothing left to ring on, and a sample-peak limiter at -3 dBFS leaves the encoder its headroom. Measured on
+# synthetic quiet-speech-and-scream clips: true peak after AAC at most -1.5 dBTP, loudness within 0.4 LU.
+TRUE_PEAK_GUARD_FILTER = (
+    "aresample=48000,lowpass=f=18000,alimiter=limit=0.708:attack=5:release=50:level=disabled:latency=1"
+)
+# The final encode's audio chain: loudness, then the true-peak guard.
+FINAL_AUDIO_FILTER = f"{LOUDNORM_FILTER},{TRUE_PEAK_GUARD_FILTER}"
 
 _EMOJI_SUPPORT_CACHE: Optional[bool] = None
 

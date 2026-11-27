@@ -41,6 +41,18 @@ export type ProductEvents = {
   ai_edit_submitted: { outcome: "accepted" | "limit_reached" };
   clip_downloaded: { surface: ClipExportSurface; format: string };
   clips_zip_downloaded: { surface: ClipExportSurface };
+  /** Agent's guided onboarding (docs/onboarding.md). */
+  onboarding_step: { step: "intro" | "link" | "making" | "ready" | "paid" | "choose" | "done" };
+  onboarding_makes_chosen: { makes: string };
+  onboarding_examples_opened: { makes: string };
+  onboarding_link_checked: { eligible: boolean; fits: boolean; duration_minutes: number; estimated_clips: number };
+  preview_started: { duration_minutes: number };
+  preview_ready: { found: number };
+  onboarding_plans_shown: { suggested: string; where: "ready" | "link" | "refused" };
+  onboarding_checkout_clicked: { plan: string; interval: string; suggested: boolean };
+  preview_unlocked: { plan: string };
+  onboarding_completed: { skipped: boolean; stage: string };
+  pebble_hint_shown: { page: string };
 };
 
 export type ProductEventName = keyof ProductEvents;
@@ -54,3 +66,4 @@ export function trackEvent<E extends ProductEventName>(event: E, properties: Pro
     // Analytics must never interrupt the product.
   }
 }
+

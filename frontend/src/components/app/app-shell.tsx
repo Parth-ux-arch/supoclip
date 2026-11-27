@@ -6,12 +6,13 @@ import { usePathname, useRouter } from "next/navigation";
 import { useLocale, useTranslations } from "next-intl";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Bot, ChartColumn, CornerDownLeft, Film, ListChecks, ListOrdered, Play, Plus, Search, Settings, Share2, Shield, Sparkles, Target, Users,
+  Bot, CalendarDays, ChartColumn, CornerDownLeft, Film, ListChecks, ListOrdered, Play, Plus, Search, Settings, Share2, Shield, Sparkles, Target, Users,
 } from "lucide-react";
 import { useSession } from "@/lib/auth-client";
 import { useBillingSummary } from "@/hooks/use-billing-summary";
 import { useSocialAccess } from "@/hooks/use-social-access";
-import { fetchGenerations, timeAgo, type GenerationSummary } from "@/lib/generations";
+import { timeAgo, type GenerationSummary } from "@/lib/generations";
+import { useGenerations } from "@/lib/queries/generations";
 import { StatusBadge } from "@/components/app/status-badge";
 import { Announcements } from "@/components/announcements";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -22,18 +23,27 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { Kbd } from "@/components/ui/kbd";
 import { cn } from "@/lib/utils";
 import { FeatureTourHost } from "@/components/feature-tour";
+import { PebbleGuide } from "@/components/onboarding/pebble-guide";
+import { usePebbleFlow } from "@/components/onboarding/pebble-flow";
+import { pebbleDockActive } from "@/components/onboarding/pebble-dock";
+import { useOnboardingStatus } from "@/hooks/use-onboarding-status";
+
+// Agent's onboarding covers what the welcome tour shows.
+const PEBBLE_SKIPS_TOURS = ["welcome"] as const;
 import { WorkspaceSwitcher } from "@/components/workspace/workspace-switcher";
 import { AccountMenu } from "@/components/app/account-menu";
 import type { Workflow } from "@/lib/workflows";
 
 // `mobile: false` keeps an item out of the five-slot mobile tab bar.
 // `social: true` items only show when social publishing is enabled for the user.
-type NavItem = { href: string; labelKey: "create" | "library" | "social" | "analytics" | "agents" | "settings"; icon: typeof Film; match: (path: string) => boolean; mobile?: boolean; social?: boolean };
+type NavItem = { href: string; labelKey: "create" | "library" | "calendar" | "social" | "analytics" | "agents" | "settings"; icon: typeof Film; match: (path: string) => boolean; mobile?: boolean; social?: boolean };
 
 const NAV: NavItem[] = [
-  { href: "/", labelKey: "create", icon: Sparkles, match: (p) => p === "/" },
+  { href: "/", labelKey: "create", icon: Sparkles, match: (p) => p === "/" || p.startsWith("/agent") },
   { href: "/list", labelKey: "library", icon: Film, match: (p) => p.startsWith("/list") || p.startsWith("/tasks") },
-  { href: "/settings/social", labelKey: "social", icon: Share2, match: (p) => p.startsWith("/settings/social"), social: true },
+  { href: "/calendar", labelKey: "calendar", icon: CalendarDays, match: (p) => p.startsWith("/calendar"), social: true },
+  // Accounts are set up once; the calendar takes its slot in the five-slot mobile tab bar.
+  { href: "/settings/social", labelKey: "social", icon: Share2, match: (p) => p.startsWith("/settings/social"), social: true, mobile: false },
   { href: "/analytics", labelKey: "analytics", icon: ChartColumn, match: (p) => p.startsWith("/analytics"), social: true },
   { href: "/settings/api-keys", labelKey: "agents", icon: Bot, match: (p) => p.startsWith("/settings/api-keys"), mobile: false },
   { href: "/settings", labelKey: "settings", icon: Settings, match: (p) => p === "/settings" },
@@ -62,6 +72,11 @@ export function AppShell({ children, tour }: { children: React.ReactNode; /** Se
   const immersive = /^\/tasks\/[^/]+\/edit/.test(pathname);
   const compact = immersive;
   const navigate = useCallback((path: string) => router.push(path), [router]);
+  const onboarding = useOnboardingStatus(Boolean(session?.user));
+  const [pebbleFlow] = usePebbleFlow(session?.user?.id);
+  const guided = onboarding?.variant === "pebble";
+  // Agent's guide and a feature tour never talk over each other.
+  const pebbleGuiding = guided && !onboarding?.completed && pebbleDockActive(pebbleFlow.stage);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -171,8 +186,10 @@ export function AppShell({ children, tour }: { children: React.ReactNode; /** Se
       </nav> : null}
 
       {user ? <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} /> : null}
+      <PebbleGuide pathname={pathname} navigate={navigate} immersive={immersive} />
       <FeatureTourHost
-        enabled={Boolean(user) && !immersive}
+        enabled={Boolean(user) && !immersive && !pebbleGuiding}
+        skip={guided ? PEBBLE_SKIPS_TOURS : undefined}
         pathname={pathname}
         navigate={navigate}
         canStart={tour !== undefined && pathname === "/"}
@@ -220,13 +237,17 @@ const WORKFLOW_SHORTCUTS = [
   { id: "trailer", icon: Play },
 ] as const;
 
+const NO_GENERATIONS: GenerationSummary[] = [];
+
 function CommandPalette({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const t = useTranslations("shell");
   const tHome = useTranslations("home");
   const locale = useLocale();
   const router = useRouter();
   const [query, setQuery] = useState("");
-  const [generations, setGenerations] = useState<GenerationSummary[]>([]);
+  const { data: session } = useSession();
+  // Disabled while closed; opening the palette refetches the list.
+  const generations: GenerationSummary[] = useGenerations(open ? session?.user?.id : undefined).data ?? NO_GENERATIONS;
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLDivElement | null>(null);
 
@@ -234,7 +255,6 @@ function CommandPalette({ open, onOpenChange }: { open: boolean; onOpenChange: (
     if (!open) return;
     setQuery("");
     setActive(0);
-    void fetchGenerations().then(setGenerations).catch(() => {});
   }, [open]);
 
   const socialAccess = useSocialAccess(open);
@@ -248,7 +268,8 @@ function CommandPalette({ open, onOpenChange }: { open: boolean; onOpenChange: (
         id: `new-${shortcut.id}`, label: tHome(`palette.${shortcut.id}`), href: `/?workflow=${shortcut.id}`, icon: shortcut.icon,
       })),
       { id: "library", label: t("palette.library"), href: "/list", icon: Film },
-      ...(socialAccess === true ? [{ id: "social", label: t("palette.social"), hint: t("palette.socialHint"), href: "/settings/social", icon: Share2 },
+      ...(socialAccess === true ? [{ id: "calendar", label: t("nav.calendar"), hint: t("palette.calendarHint"), href: "/calendar", icon: CalendarDays },
+      { id: "social", label: t("palette.social"), hint: t("palette.socialHint"), href: "/settings/social", icon: Share2 },
       { id: "analytics", label: t("nav.analytics"), hint: t("palette.analyticsHint"), href: "/analytics", icon: ChartColumn }] : []),
       { id: "keys", label: t("nav.agents"), hint: t("palette.agentsHint"), href: "/settings/api-keys", icon: Bot },
       { id: "team", label: t("palette.team"), hint: t("palette.teamHint"), href: "/settings/team", icon: Users },

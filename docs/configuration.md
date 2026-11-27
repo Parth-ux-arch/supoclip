@@ -71,7 +71,9 @@ In most cases, edit `.env` and then rebuild or restart the stack.
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `ASSEMBLY_AI_API_KEY` | Yes | Enables word-level transcription used for clip extraction and subtitles |
+| `TRANSCRIPTION_PROVIDER` | No (`assemblyai`) | Selects transcription backend: `assemblyai`, `soniox`, `whisper`, or `youtube_captions` |
+| `ASSEMBLY_AI_API_KEY` | When `assemblyai` | Enables word-level transcription and speaker diarization via AssemblyAI |
+| `SONIOX_API_KEY` | When `soniox` | Enables word-level transcription and speaker diarization via Soniox Async API |
 
 ### LLM selection
 
@@ -97,6 +99,7 @@ The backend can infer a default LLM from whichever API key is present, but setti
 | `BETTER_AUTH_TRUSTED_ORIGINS` | unset | Additional explicit comma-separated HTTP(S) browser origins for authentication; no wildcard support |
 | `BETTER_AUTH_SECRET` | Dev secret | Frontend auth secret; must be changed in non-local environments |
 | `DISABLE_SIGN_UP` | `false` | Prevents creation of new user accounts when set |
+| `EMAIL_VERIFICATION_REQUIRED_SINCE` | unset | ISO 8601 time. Accounts created at or after it get no session until they open the emailed verification link (signing in resends it); older accounts are unaffected. Needs working email (SES). An invalid value stops the frontend from starting |
 | `NEXT_PUBLIC_LANDING_ONLY_MODE` | `false` | Restricts the UI to the landing page only |
 | `TEMP_DIR` | `/app/uploads` in Docker | Working directory for uploads, caches and renders. With `MEDIA_STORAGE=local` the API and workers must share it; with `s3` each machine has its own |
 | `MEDIA_STORAGE` | `local` | `s3` stores durable media in a private bucket; see [Media storage](media-storage.md) for configuration, retention and migration |
@@ -154,8 +157,16 @@ These settings affect clip generation speed, throughput, and defaults.
 | `FAST_MODE_TRANSCRIPT_MODEL` | `universal-3-5-pro` | Fast mode uses the Pro model too; `universal-2` covers languages Pro doesn't. `nano`/`universal-2` select the cheaper model for self-hosting |
 | `ASSEMBLY_AI_SPEECH_MODEL` | Empty | Overrides the AssemblyAI model for every processing mode. Set `universal-2` to use only the non-Pro model while retaining word timings and speaker labels; takes precedence over `FAST_MODE_TRANSCRIPT_MODEL` |
 | `ASSEMBLY_AI_REQUEST_TIMEOUT_SECONDS` | `60` | Per-request upload/submit timeout (5–300). Transient upload failures retry up to 3 times; the paid submission is attempted once |
+| `SONIOX_MODEL` | `stt-async-v6` | Soniox async speech model used when `TRANSCRIPTION_PROVIDER=soniox` |
+| `SONIOX_BASE_URL` | `https://api.soniox.com` | Base URL for the Soniox REST API |
+| `SONIOX_HTTP_TIMEOUT_SECONDS` | `900` | Total status-polling budget in seconds after a Soniox transcription is submitted |
+| `SONIOX_REQUEST_TIMEOUT_SECONDS` | `60` | Per-request upload/submit timeout (5–300) for Soniox. Transient upload failures retry up to 3 times; the paid submission is attempted once |
 | `WHISPER_MODEL_SIZE` | `medium` in `.env.example` | Whisper model size when Whisper is used locally |
 | `QUEUED_TASK_TIMEOUT_SECONDS` | `180` | Marks stale queued tasks as failed instead of leaving them stuck forever |
+| `CLIP_EDGE_REVIEW` | `true` | After clips are picked, one small model call per clip (`CLIP_EDGE_LLM`) checks where it opens and closes and may move an edge by a few sentences; code validates every move. `false` keeps the rule-based sentence edges only |
+| `CLIP_EDGE_LLM` | Claude Sonnet 5.5 when `ANTHROPIC_API_KEY` is set, else `RERANK_LLM`, else `LLM` | The model for the edge review. A few hundred tokens per clip, so the strongest model is cheap here, and it is the call that decides whether a clip stands on its own |
+| `CLIP_EDGE_LISTEN` | `auto` | The bundled Whisper listens to the four seconds on either side of each cut and corrects word times and a misplaced full stop the transcript has wrong there, so a clip does not end on the first word of the next sentence or lose the start of its first word (`media/edge_listen.py`). Every correction must be confirmed by the audio itself. `auto`: only when the model file is already on the machine (the backend image bakes it in); `on`: load it, downloading if needed; `off`. About 2.5 s of CPU per cut with the default model, and about 1 GB of memory in each process that renders (the model stays loaded). Corrections are held in the process that found them and found again by any other that needs them; nothing is written to the shared transcript |
+| `CLIP_EDGE_LISTEN_MODEL` | `small` | Whisper model for that check (`base` is three times faster and less accurate). Build the image with `--build-arg EDGE_LISTEN_MODEL=<name>` to bake a different one, or empty to leave it out. With `auto`, a model named here that is not the one in the image means the check stays off |
 | `VIDEO_JOB_USER_CONCURRENCY` | `1` | Long video renders one account may run at once. Extra videos from that account wait without taking a worker slot. `1` is the default because a render can occupy a slot for hours; set `2` to allow two at once |
 | `VIDEO_JOB_DEFER_SECONDS` | `20` | How long a video over the per-account cap waits before a worker checks again (5–300). The waiting job is not charged again |
 | `QUEUE_DELAY_ALERT_SECONDS` | `600` | Pickup delay, from enqueue until a worker starts the job, that reports `queue_delay_exceeded` to PostHog |
@@ -163,9 +174,12 @@ These settings affect clip generation speed, throughput, and defaults.
 | `EMBED_CRON_WORKER` | `1` | When `1`, the worker process also starts the cron worker on queue `supoclip_cron`. Set `0` if the optional Compose `cron-worker` service (profile `cron`) is running instead, and on video workers that run on a different machine from the API |
 | `UPLOAD_COPY_WAIT_SECONDS` | `1800` | How long a video worker on another machine waits for an upload to be copied from the API's disk to object storage before the task fails (minimum 60). See [Video workers on other machines](./render-worker.md) |
 | `MAX_VIDEO_DURATION` | `5400` | Maximum source length in seconds without an active paid plan (hosted mode only, `SELF_HOST=false`; self-hosted installs have no video length limit) |
-| `MAX_VIDEO_UPLOAD_BYTES` | `4000000000` | Maximum uploaded file size, in bytes (4 GB). Checked in the browser before the upload starts, and again by the API and presigned upload session so it cannot be bypassed. Set `NEXT_PUBLIC_MAX_VIDEO_UPLOAD_BYTES` to the same value so the pre-upload check matches before the billing summary loads. Sources above 1080p or 60 fps are scaled down to that ceiling before transcription and rendering; plans with a lower output resolution still receive that lower resolution |
+| `MAX_VIDEO_UPLOAD_BYTES` | `4000000000` | Maximum uploaded file size, in bytes (4 GB), for self-hosted installs, accounts without a paid plan, and the API-spooled `/upload` route. Paid plans use the `*_MAX_VIDEO_UPLOAD_BYTES` caps below. Checked in the browser before the upload starts, and again by the API and presigned upload session so it cannot be bypassed. Set `NEXT_PUBLIC_MAX_VIDEO_UPLOAD_BYTES` to the same value so the pre-upload check matches before the billing summary loads. Sources above 1080p or 60 fps are scaled down to that ceiling before transcription and rendering; plans with a lower output resolution still receive that lower resolution |
 | `PRO_YOUTUBE_MAX_VIDEO_DURATION` | `7200` | Maximum length of one video (any source: YouTube, Twitch, Kick, upload) for active or trialing Pro subscriptions, in seconds (hosted mode only). Keep `NEXT_PUBLIC_PRO_YOUTUBE_MAX_MINUTES` in step |
 | `SCALE_YOUTUBE_MAX_VIDEO_DURATION` | `10800` | Maximum length of one video (any source) for active or trialing Creator (`scale`) subscriptions, in seconds (hosted mode only). Keep `NEXT_PUBLIC_SCALE_YOUTUBE_MAX_MINUTES` in step |
+| `PRO_MAX_VIDEO_UPLOAD_BYTES` | `60000000000` | Maximum direct upload size in bytes for active or trialing Pro subscriptions (60 GB: two hours at about 66 Mbps, above a 4K60 recording; hosted mode only). Checked when the upload is authorized |
+| `SCALE_MAX_VIDEO_UPLOAD_BYTES` | `90000000000` | Same for Creator (`scale`) subscriptions (90 GB: three hours at about 66 Mbps) |
+| `TEAM_MAX_VIDEO_UPLOAD_BYTES` | `90000000000` | Same for Team workspaces (90 GB). Object storage refuses any upload above the largest of these caps |
 | `MAX_CLIPS` | `10` | Hard cap on clips per task in every processing mode |
 | `CLIP_DURATION` | `30` | Default clip duration target in seconds |
 
@@ -374,6 +388,12 @@ Required when `SELF_HOST=false` and you want subscription management:
 | `STRIPE_PRICE_ID` | Legacy fallback price identifier for the Pro plan |
 | `STRIPE_CHECKOUT_URL` | Optional fallback checkout URL |
 | `STRIPE_CUSTOMER_PORTAL_URL` | Optional fallback billing portal URL |
+| `STRIPE_CONNECT_PLATFORM_ACCOUNT_ID` | Optional: the Stripe account that creates creators' Connect Express accounts and pays their commission. Empty = the account new checkouts open in (`STRIPE_CHECKOUT_ACCOUNT_ID`, else the source). See `docs/creator-program.md` |
+
+The billing webhook needs `checkout.session.completed`, `checkout.session.expired`,
+`customer.subscription.updated`, `customer.subscription.deleted`, `invoice.paid`,
+`invoice.payment_succeeded` and `invoice.payment_failed`. Creator commission also needs
+`charge.refunded`, `charge.dispute.created` and `charge.dispute.closed`, on every billing endpoint.
 
 #### Team plan
 
@@ -405,6 +425,22 @@ personal subscriptions.
 | `AWS_ACCESS_KEY_ID` | AWS access key ID used to send hosted billing lifecycle emails |
 | `AWS_SECRET_ACCESS_KEY` | AWS secret access key used to send hosted billing lifecycle emails |
 | `SES_FROM_EMAIL` | Verified sender address for subscription emails, default `SupoClip <onboarding@example.com>` |
+
+#### Unfinished upgrade emails
+
+An upgrade Checkout expires one hour after it opens (`expires_at`) with
+`after_expiration.recovery` enabled. When the webhook receives
+`checkout.session.expired` for a subscription Checkout that still has a free user
+behind it (most often a declined card), it calls `/billing/subscription-email`
+with `{"event":"checkout_recovery","recovery_url":...}`. The backend sends one
+short email with Stripe's recovery link, which stays valid for 30 days. It goes
+through the [product-email preferences](product-update-emails.md), so opted-out
+users get nothing. A user receives at most one per calendar month (a
+`checkout_recovery:<user>:<month>` row in `stripe_webhook_events`, released if
+sending fails so Stripe's retry can send it). Team checkouts are skipped.
+
+Subscribe every Stripe billing webhook endpoint (the root and each account route)
+to `checkout.session.expired`.
 
 #### Scheduled cancellation emails
 

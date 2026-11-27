@@ -113,8 +113,21 @@ utils/               → Thread pool helpers for blocking operations (async_help
 2. **Transcription** → AssemblyAI word-level timestamps (cached as `.transcript_cache.json`)
 3. **AI Analysis** → Pydantic AI selects viral segments (15-60s each) with virality scoring. Transcripts over 15 min are analysed in 12-min windows (2-min overlap, 3 concurrent), deduplicated, then reranked together in one comparative call (`RERANK_LLM`, default `LLM`); final count scales ~1 clip per 5 min, capped by `MAX_CLIPS` (default 10)
 4. **Clip Generation** → ffmpeg filter graphs (`media/reframing.py`, `media/ffmpeg.py`) render 9:16 clips with:
+   - Sentence edges: the analysis' whole-second labels become a first and a last sentence unit
+     (`media/sentence_bounds.py`, on `workflows/units.py`), so a highlight opens on a sentence that stands
+     alone and closes on a finished one, in any language; the cap moves the end back a sentence, never into one
+     (`CLIP_EDGE_REVIEW`, on by default: one small model call per clip, `CLIP_EDGE_LLM`, is told what the clip
+     is about and may move an edge a few sentences, off a leftover of the topic before, to the question an
+     opening answers or the payoff a closing stops short of; `apply_edge_review` validates it).
+     `media/edge_listen.py` (`CLIP_EDGE_LISTEN`) has the bundled Whisper listen to the seconds around each cut and
+     corrects word times and a misplaced full stop there, in memory, when the audio confirms it
    - Face-centered cropping: YuNet (`cv2.FaceDetectorYN`, `media/face_detection.py`) → Haar cascade fallback
-   - Word-synced subtitles from AssemblyAI
+   - Fill-first 9:16 framing (`media/scene_context.py`, `docs/automatic-framing.md`): every shot fills the
+     frame (face crop, or a full-height cover crop); the whole 16:9 picture on blur (`fit`) is only for content
+     the local OCR confirms (`media/screen_text.py`: a page or a card, Latin script), never a default
+   - Word-synced subtitles from AssemblyAI. Text the source burns in is read first (`media/source_captions.py`):
+     ours are left off when the source already captions the speech and shows it whole, the source's lines are
+     painted out when the crop cuts them, and otherwise ours move clear of its band
    - Custom fonts (TTF files in `backend/fonts/`)
    - Optional transition effects (`backend/transitions/`)
    - Optional B-roll overlays (Pexels API)
@@ -163,6 +176,8 @@ PostgreSQL 15. Schema in `init.sql`. Mixed naming conventions:
 | `src/media_replication_ledger.py`, `src/sync_db.py` | Pending two-bucket replication in PostgreSQL, usable from boto threads |
 | `src/ai.py` | Pydantic AI agents, system prompt, segment validation |
 | `src/video_utils.py` | Clip render composition, FX render ladder (`create_optimized_clip`), subtitles |
+| `src/media/sentence_bounds.py`, `src/media/edge_listen.py` | Highlights' sentence edges; the second listen at each cut (in-process word corrections) |
+| `src/media/scene_context.py`, `src/media/screen_text.py`, `src/media/source_captions.py` | Fill-first 9:16 plan, local OCR, text the source burns in |
 | `src/clip_editor.py` | Clip trim, split, merge, export presets |
 | `src/editor_document.py` | Clip studio draft model (segments, words, captions, framing, B-roll) and server render |
 | `src/workflows/` | Workflows (series, topic, recap, trailer): contracts, options/gate, units, outline, planners, solvers |
@@ -216,7 +231,8 @@ PostgreSQL 15. Schema in `init.sql`. Mixed naming conventions:
 **Social publishing:**
 - `GET /social/providers`, `GET /social/connections` — configured platforms and connected accounts
 - `POST /social/connections/{provider}/authorize` + `/callback` — OAuth handshake (session auth only)
-- `POST /social/posts` — publish or schedule a clip; `GET /social/posts?task_id=` — list with metrics
+- `POST /social/posts` — publish or schedule a clip; `GET /social/posts?task_id=` — list with metrics (`starts_at`/`ends_at` for the calendar)
+- `PATCH /social/posts/{id}` — move or reword a scheduled post
 - `POST /social/posts/{id}/cancel|retry|refresh-metrics`, `DELETE /social/posts/{id}`
 - `GET /social/performance` — metrics by hook type / platform / clip length (also fed into the AI prompt)
 - `GET /social/performance/timeseries?days=30` — daily new views from metrics snapshots (Analytics chart)
@@ -290,6 +306,15 @@ table (one per user, `slug` cleared on decline).
   (20% off for 3 months), added by hand in App Store Connect; admins then mark
   "App Store code added" and the creator page shows `appStoreRedeemUrl(code)`.
   The app's paywall opens Apple's redeem sheet ("Have a creator code?").
+- **Commission:** only for creators living in a Stripe payout country (US, UK, CA, CH, EEA; asked on the
+  application, `affiliates.country`, `ZZ` = elsewhere: they keep free Pro and their code). 30% of what a referred customer pays on the web (after discount, without tax) for
+  their first 12 months, held 30 days (`lib/creator-commission.ts`). Checkout stores `creator_code` on
+  the subscription; `invoice.paid` writes `affiliate_commissions` rows, `charge.refunded` and disputes
+  write negative ones, all idempotent by Stripe ID (`server/affiliate-commissions.ts`). Creators connect
+  a Stripe Connect Express account on the US account (the checkout account) from their creator page,
+  commission is kept in USD and one 12-month window per customer; admins pay everyone once a month from
+  `/admin` (`server/affiliate-payouts.ts`, one Transfer per creator, payout ID as idempotency key and
+  transfer group). Setup and operations: `docs/creator-program.md`.
 
 ## Pull requests
 
@@ -345,8 +370,17 @@ WORKFLOW_FULL_CONTEXT_MAX_WORDS=0    # Words read in one outline call; 0 = provi
 REDIS_HOST=localhost                 # Default: localhost
 REDIS_PORT=6379                      # Default: 6379
 QUEUED_TASK_TIMEOUT_SECONDS=180      # Fail-safe for stuck tasks
+CLIP_EDGE_REVIEW=true                # One small model call per clip checks its first/last sentence (false: rules only)
+CLIP_EDGE_LLM=                       # Model for that call (default: Claude Sonnet 5.5 with ANTHROPIC_API_KEY, else RERANK_LLM/LLM)
+CLIP_EDGE_LISTEN=auto                # Bundled Whisper checks word times at each cut: auto (model on disk) | on | off
+CLIP_EDGE_LISTEN_MODEL=small         # Whisper model for that check; the image bakes this one in (build arg EDGE_LISTEN_MODEL)
 UPLOAD_COPY_WAIT_SECONDS=1800        # Worker on another machine: wait for an upload to reach the bucket
 AI_EDIT_DAILY_LIMIT=150              # Studio AI edits per user per day (needs ANTHROPIC_API_KEY)
+AGENT_MODEL=claude-sonnet-5-5        # Agent home screen model (needs ANTHROPIC_API_KEY)
+AGENT_DAILY_TURN_LIMIT=150           # Agent messages per user per 24 hours
+AGENT_TRIAL_MESSAGES=5               # Free Agent messages for paid Pro accounts (lifetime)
+AGENT_ONBOARDING_SINCE=2026-11-24T00:00:00Z # Accounts created since then get the home choice screen
+PREVIEW_MAX_MINUTES=90               # Longest video a free preview clip takes (PREVIEW_DAILY_LIMIT caps them per day)
 TEMP_DIR=/tmp                        # Uploads, caches, renders; per machine when MEDIA_STORAGE=s3
 EDIT_PLAN_LLM=                       # Dynamic edits beat tagging model (default: LLM)
 EDIT_PLAN_TIMEOUT_SECONDS=45         # Past it: heuristic beats
@@ -454,6 +488,34 @@ AI worker → Claude Sonnet 5.5 returns typed operations (`keep_ranges`, `remove
 `apply_plan` clamps and validates → the browser applies the result as one undoable change (never over edits made
 meanwhile). Keep the output schema free of optional fields: the API rejects schemas whose grammar is too large.
 
+### Creator agent and posting calendar
+
+Creator (and Team) plans can make home an agent: a chat where Claude Sonnet 5.5 clips, edits, schedules and
+publishes for them. Full design in `docs/creator-agent.md`.
+
+- **Home:** `users.home_mode` (`agent` | `manual` | NULL = ask once); Settings → Home screen; `?mode=manual|agent`
+  opens the other one once (`homeScreenFor` in `home-router.tsx`). Gate: `agent/access.py` (Creator/Team paid,
+  admins, every self-host; paid Pro gets `AGENT_TRIAL_MESSAGES` free messages; Free sees it locked and gets the
+  upgrade dialog's `agent` reason) plus the `creator_agent` feature flag. The choice screen goes to full access
+  and accounts created since `AGENT_ONBOARDING_SINCE` (`offer_choice`).
+- **Turns run in the API process** (`backend/src/agent/runtime.py`), stream over a Redis stream to SSE
+  (`/agent/conversations/{id}/events`), and call SupoClip's own routes in-process as the user
+  (`agent/api_client.py`), so every limit and check applies. Transcript is append-only content blocks in
+  `agent_messages`; `publish_now`/`delete_project` wait for approval in the chat.
+- **Tools** (`agent/tools.py`): library, create project, follow-up when a project finishes, studio edits in the
+  background (`agent_jobs`), trim, restyle, captions, schedule/publish/move/cancel posts, posting times,
+  performance, defaults, memory, and `show_options` (tappable chips, choice cards, clip and time pickers).
+- **Calendar:** `/calendar`; `GET /social/posts?starts_at&ends_at`, `PATCH /social/posts/{id}` (scheduled only).
+
+### Onboarding guided by Agent and the free preview clip
+
+Every new account (created since the launch, `GUIDED_SINCE` in `onboarding/variant.py`; flag `pebble_onboarding` per
+platform) is guided by Agent: a scripted intro on home, then a docked guide on the real pages
+(`frontend/src/components/onboarding/`). It was an A/B test against the old onboarding until 2026-11-25. Their first clip is free: `POST /tasks/` with `"preview": true`
+renders only the best clip and lists the rest as locked moments in `tasks.preview` (never charged; edits answer 402
+`PREVIEW_LOCKED`); `POST /tasks/{id}/unlock` charges the minutes and renders the rest in place. Checkout takes
+`return_to` back to the project. Limits: `PREVIEW_MAX_MINUTES`, `PREVIEW_DAILY_LIMIT`. Full design: `docs/onboarding.md`.
+
 ### Workflows (series, topic clips, recap, trailer)
 
 `tasks.workflow` picks what a task makes: `highlights` (default, unchanged), `series` (Part 1..N of one
@@ -468,7 +530,9 @@ story, adjacent parts share one exact cut), `topic` (every strong moment about `
 - **Locked render:** planned segments (`source_ranges`, `planned: True`) skip snapping, end extension and the
   cold-open teaser; multi-range clips use explicit output offsets everywhere. The plan is saved to
   `tasks.workflow_plan` before rendering; clips carry `workflow_role`, `part_number`, `workflow_meta`.
-- **Invariant:** highlights without instructions is byte-identical (prompts, cache keys, job args, render path).
+- **Invariant:** a workflow never changes highlights without instructions (prompts, cache keys, job args,
+  render path). Highlights' own cut and framing rules live in `media/sentence_bounds.py` and
+  `media/scene_context.py`.
 - **Fail loud, refund:** a workflow that can't deliver raises `WorkflowError` (`topic_not_found` with suggested
   topics, `no_story`, `trailer_unbuildable`, …); its clips are deleted so the minutes are refunded, and
   `error_code` drives the task page's next-step screen. Series/recap/trailer are all-or-nothing.
@@ -514,7 +578,8 @@ Edit `backend/src/ai.py`: `simplified_system_prompt` controls selection criteria
 
 ## Observability
 
-Errors and analytics go to PostHog (project "SupoClip", EU, id `314504`); logs go to
+Errors and analytics go to self-hosted PostHog (`https://ph.supoclip.com`, project "SupoClip", id `1`;
+history before 2026-11-24 is in EU cloud project `314504`); logs go to
 Axiom (dataset `supoclip-prod`). Everything is off unless tokens are set. Details in
 `docs/observability.md`.
 

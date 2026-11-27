@@ -1,6 +1,8 @@
 "use client";
 
+import { PebbleIcon } from "@/components/agent/agent-mark";
 import { useState, useRef, useEffect, useCallback, useMemo, useId } from "react";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTranslations } from "next-intl";
@@ -28,6 +30,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { PaymentFailedBanner } from "@/components/payment-failed-banner";
 import { SubscriptionCancelBanner } from "@/components/subscription-cancel-banner";
+import type { LockedAgent } from "@/components/home-router";
+import { emitPebble } from "@/lib/pebble-events";
 import { UpgradeDialog, UpgradeNudge, getUpgradeState, memberLimitReason, upgradeReasonForError, useBillingPlanText, type UpgradeReason } from "@/components/billing/upgrade-prompt";
 import { getPublicBillingPlans, type PublicBillingPlan } from "@/lib/billing-plans";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -43,11 +47,13 @@ import { billingPlanMessageKey } from "@/lib/billing-plans";
 import { hasPaidAccess } from "@/lib/subscription-status";
 import { trackEvent } from "@/lib/analytics";
 import { startUpgrade } from "@/lib/start-upgrade";
-import { track } from "@/lib/datafast";
+import { track, trackTillyGoal } from "@/lib/datafast";
 import { taskPathFromCreate } from "@/lib/task-create";
 import { formatSupportMessage, parseApiError, type ApiErrorInfo } from "@/lib/api-error";
 import { buildFontOptionsPayload, FONT_TEMPLATE_DEFAULT_VALUE, savedCaptionDefaults, STOCK_FONT_DEFAULTS } from "@/lib/font-options";
-import { fetchGenerations, type GenerationSummary } from "@/lib/generations";
+import type { GenerationSummary } from "@/lib/generations";
+import { createOptionKeys, fetchBrollConfigured, fetchFonts } from "@/lib/queries/create-options";
+import { useGenerations } from "@/lib/queries/generations";
 import { CLIP_LENGTHS, isClipLength, type ClipLength } from "@/lib/clip-duration";
 import {
   INSTRUCTIONS_MAX_CHARS, isWorkflow, MIN_SOURCE_SECONDS, normalizeTopic, PART_COUNT_OPTIONS, TOPIC_MAX_CHARS, topicIssue,
@@ -59,6 +65,19 @@ import { DEFAULT_MIN_RANGE_SECONDS, defaultSourceRange, sourceRangeFields, sourc
 import { FontSelectOption, type FontOption } from "@/components/font-select-option";
 import { DEFAULT_EDIT_STYLE, isFxTemplate, type EditStyle } from "@/lib/fx/core/types";
 import { editStylePreference, fxCreateFields, offeredFxTemplates, sendableCaptionTemplate } from "@/lib/fx/edit-style-request";
+
+const NO_FONTS: FontOption[] = [];
+const NO_TEMPLATES: CaptionTemplate[] = [];
+
+/** Recent generations on the home screen. */
+const RECENT_COUNT = 8;
+
+async function fetchCaptionTemplates(includeFx: boolean): Promise<CaptionTemplate[]> {
+  const response = await fetch(includeFx ? "/api/caption-templates?include=fx" : "/api/caption-templates");
+  if (!response.ok) throw new Error(`Failed to load caption templates (${response.status})`);
+  const data = (await response.json()) as { templates?: CaptionTemplate[] } | null;
+  return data?.templates || [];
+}
 
 interface CaptionTemplate {
   id: string;
@@ -148,7 +167,16 @@ function greetingText(t: ReturnType<typeof useTranslations<"home">>, name?: stri
   return first ? t("greeting.named", { greeting: part, name: first }) : part;
 }
 
-export default function HomeApp() {
+/**
+ * `agentLink`: where "Ask the agent instead" goes, when the agent is offered to this person.
+ * `agentLocked`: the agent needs Creator here, so the link opens the upgrade dialog instead.
+ */
+export default function HomeApp({ agentLink, agentLocked, preview }: {
+  agentLink?: string;
+  agentLocked?: LockedAgent;
+  /** Agent's onboarding: this account's first clip from its own video is free (onboarding/preview.py). */
+  preview?: { active: boolean };
+} = {}) {
   const t = useTranslations("home");
   const tCommon = useTranslations("common");
   const [url, setUrl] = useState("");
@@ -166,14 +194,11 @@ export default function HomeApp() {
   const [fontFamily, setFontFamily] = useState<string | null>(null);
   const [fontSize, setFontSize] = useState<number | null>(null);
   const [fontColor, setFontColor] = useState<string | null>(null);
-  const [availableFonts, setAvailableFonts] = useState<FontOption[]>([]);
   const [fontSearch, setFontSearch] = useState("");
-  const [fontLoadError, setFontLoadError] = useState<string | null>(null);
   const [isUploadingFont, setIsUploadingFont] = useState(false);
   const fontUploadInputRef = useRef<HTMLInputElement | null>(null);
 
   const [captionTemplate, setCaptionTemplate] = useState("default");
-  const [availableTemplates, setAvailableTemplates] = useState<CaptionTemplate[]>([]);
   // Dynamic edits: offered only when the server says the flag is on for this user (`enabled === true`).
   const editStylesInfo = useEditStylesInfo(Boolean(session?.user?.id));
   const fxEnabled = editStylesInfo?.enabled === true;
@@ -185,7 +210,6 @@ export default function HomeApp() {
   const clipLengthEdited = useRef(false);
   const clipLengthSave = useRef<Promise<unknown>>(Promise.resolve());
   const [addSubtitles, setAddSubtitles] = useState(true);
-  const [brollAvailable, setBrollAvailable] = useState(false);
   const [includeBroll, setIncludeBroll] = useState(false);
   const [cutLongPauses, setCutLongPauses] = useState(true);
   const [pauseThresholdMs, setPauseThresholdMs] = useState("1200");
@@ -253,7 +277,12 @@ export default function HomeApp() {
     try { window.localStorage.setItem(WORKFLOW_STORAGE_KEY, workflow); } catch { /* storage blocked: still works for this visit */ }
   }, [workflow]);
 
-  const [recent, setRecent] = useState<GenerationSummary[] | null>(null);
+  // The library's cache: shared with /list and the command palette, and live while a generation is processing.
+  const generations = useGenerations(session?.user?.id);
+  const recent = useMemo<GenerationSummary[] | null>(() => {
+    if (generations.data) return generations.data.slice(0, RECENT_COUNT);
+    return generations.isError ? [] : null;
+  }, [generations.data, generations.isError]);
   const [billingSummary, updateBillingSummary] = useBillingSummary(Boolean(session?.user?.id));
   const [upgradeReason, setUpgradeReason] = useState<UpgradeReason | null>(null);
   const [lastUpgradeReason, setLastUpgradeReason] = useState<UpgradeReason>({ kind: "start" });
@@ -295,6 +324,14 @@ export default function HomeApp() {
     if (key === enteredSource.current) return;
     enteredSource.current = key;
     trackEvent("source_entered", { source_kind: sourceKind });
+  }, [file, url, urlSource]);
+
+  // Agent's onboarding looks at a pasted link (title, length, how many clips) once typing stops.
+  useEffect(() => {
+    if (file || !urlSource) return;
+    const link = url.trim();
+    const timer = window.setTimeout(() => emitPebble("pebble:source", { url: link }), 600);
+    return () => window.clearTimeout(timer);
   }, [file, url, urlSource]);
 
   useEffect(() => {
@@ -384,58 +421,45 @@ export default function HomeApp() {
     });
   }
 
-  const refreshFonts = useCallback(async () => {
-    try {
-      setFontLoadError(null);
-      const response = await fetch("/api/fonts", { cache: "no-store" });
-      if (!response.ok) throw new Error(`Failed to load fonts (${response.status})`);
-      const data = await response.json();
-      const fonts: FontOption[] = data.fonts || [];
-      setAvailableFonts(fonts);
-
-      const styleElement = document.createElement("style");
-      styleElement.id = "custom-fonts";
-      styleElement.innerHTML = fonts.map((font) => `
+  const queryClient = useQueryClient();
+  const fontsQuery = useQuery({ queryKey: createOptionKeys.fonts, queryFn: fetchFonts });
+  const availableFonts = fontsQuery.data ?? NO_FONTS;
+  const fontLoadError = fontsQuery.isError && !fontsQuery.isFetching ? t("errors.fonts") : null;
+  useEffect(() => {
+    if (fontsQuery.error) console.error("Failed to load fonts:", fontsQuery.error);
+  }, [fontsQuery.error]);
+  useEffect(() => {
+    if (!fontsQuery.data) return;
+    const styleElement = document.createElement("style");
+    styleElement.id = "custom-fonts";
+    styleElement.innerHTML = fontsQuery.data.map((font) => `
         @font-face {
           font-family: '${font.name}';
           src: url('/api/fonts/${font.name}') format('${font.format === "otf" ? "opentype" : "truetype"}');
           font-weight: normal;
           font-style: normal;
         }`).join("\n");
-      document.getElementById("custom-fonts")?.remove();
-      document.head.appendChild(styleElement);
-    } catch (error) {
-      console.error("Failed to load fonts:", error);
-      setFontLoadError(t("errors.fonts"));
-    }
-  }, [t]);
+    document.getElementById("custom-fonts")?.remove();
+    document.head.appendChild(styleElement);
+  }, [fontsQuery.data]);
 
-  useEffect(() => { void refreshFonts(); }, [refreshFonts]);
-
+  // Animated templates are asked for only once dynamic edits are on, so nobody else ever sees their ids.
+  const templatesQuery = useQuery({
+    queryKey: createOptionKeys.captionTemplates(fxEnabled),
+    queryFn: () => fetchCaptionTemplates(fxEnabled),
+    // The standard list stays up while the one with animated templates loads.
+    placeholderData: keepPreviousData,
+  });
+  const availableTemplates = templatesQuery.data ?? NO_TEMPLATES;
   useEffect(() => {
-    // Animated templates are asked for only once dynamic edits are on, so nobody else ever sees their ids.
-    let cancelled = false;
-    fetch(fxEnabled ? "/api/caption-templates?include=fx" : "/api/caption-templates")
-      .then((response) => (response.ok ? response.json() : null))
-      .then((data) => { if (data && !cancelled) setAvailableTemplates(data.templates || []); })
-      .catch((error) => console.error("Failed to load caption templates:", error));
-    return () => { cancelled = true; };
-  }, [fxEnabled]);
+    if (templatesQuery.error) console.error("Failed to load caption templates:", templatesQuery.error);
+  }, [templatesQuery.error]);
 
-  useEffect(() => {
-    // B-roll is only offered when the server has a stock footage provider.
-    fetch("/api/broll/status")
-      .then((response) => (response.ok ? response.json() : null))
-      .then((data) => setBrollAvailable(data?.configured === true))
-      .catch(() => setBrollAvailable(false));
-  }, []);
-
-  useEffect(() => {
-    if (!session?.user?.id) return;
-    fetchGenerations()
-      .then((tasks) => setRecent(tasks.slice(0, 8)))
-      .catch((error) => { console.error("Failed to load recent generations:", error); setRecent([]); });
-  }, [session?.user?.id]);
+  // B-roll is only offered when the server has a stock footage provider.
+  const { data: brollAvailable = false } = useQuery({
+    queryKey: createOptionKeys.brollStatus,
+    queryFn: fetchBrollConfigured,
+  });
 
   const attachFile = (next: File | null) => {
     if (next && !next.type.startsWith("video/") && !/\.(mp4|mov|avi|mkv|webm|m4v)$/i.test(next.name)) {
@@ -457,7 +481,9 @@ export default function HomeApp() {
     setSourceSeconds(null);
     if (next) {
       void readVideoDuration(next).then((seconds) => {
-        if (durationFile.current === next) setSourceSeconds(seconds);
+        if (durationFile.current !== next) return;
+        setSourceSeconds(seconds);
+        if (seconds) emitPebble("pebble:file", { durationSeconds: seconds });
       });
     }
     if (!next && fileInputRef.current) fileInputRef.current.value = "";
@@ -659,7 +685,7 @@ export default function HomeApp() {
       }
       const data = await response.json();
       if (data?.font?.name) setFontFamily(data.font.name);
-      await refreshFonts();
+      await queryClient.invalidateQueries({ queryKey: createOptionKeys.fonts });
     } catch (uploadError) {
       console.error("Failed to upload font:", uploadError);
       setError(t("errors.uploadFontRetry"));
@@ -891,7 +917,9 @@ export default function HomeApp() {
       has_instructions: Boolean(sentInstructions),
       blocked_by_upgrade: generationRequiresUpgrade,
     });
-    if (generationRequiresUpgrade) {
+    // The free preview: plain highlights of one linked video, nothing else on top.
+    const freePreview = Boolean(preview?.active && generationRequiresUpgrade && activeWorkflow === "highlights" && !sentInstructions);
+    if (generationRequiresUpgrade && !freePreview) {
       // A limit a team admin set for this member is not something a plan fixes.
       openUpgrade(memberLimitReason(billingSummary) ?? { kind: upgradeState?.isPaid ? "limit" : "start" });
       return;
@@ -944,7 +972,8 @@ export default function HomeApp() {
         remove_filler_words: removeFillerWords,
         filtered_words: normalizedFilteredWords,
         // Only when intensity isn't off: an off request stays exactly today's.
-        ...(fxFields.edit_style ? { edit_style: fxFields.edit_style } : {}),
+        ...(fxFields.edit_style && !freePreview ? { edit_style: fxFields.edit_style } : {}),
+        ...(freePreview ? { preview: true } : {}),
       };
       // Plain highlights without instructions sends exactly the request it always has.
       const options: WorkflowOptions = {};
@@ -966,6 +995,14 @@ export default function HomeApp() {
 
       if (!startResponse.ok) {
         const info = await parseApiError(startResponse, t("errors.api", { status: startResponse.status }));
+        if (freePreview && (info.code === "VIDEO_TOO_LONG" || info.code === "PREVIEW_UNAVAILABLE")) {
+          // Agent explains (in the dock) and offers the plans; the form shows the same line.
+          emitPebble("pebble:preview-error", { code: info.code ?? null, message: info.message });
+          setError(info.message);
+          setIsLoading(false);
+          setStatusMessage("");
+          return;
+        }
         if (info.code === "VIDEO_DURATION_UNAVAILABLE") {
           setLengthError({ kind: "durationUnavailable" });
           setIsLoading(false);
@@ -1022,6 +1059,10 @@ export default function HomeApp() {
         filtered_words: normalizedFilteredWords,
         processing_mode: "fast",
       });
+      if (freePreview && startResult.task_id && !alreadyProcessing) {
+        trackTillyGoal("preview_task_created");
+        emitPebble("pebble:preview-started", { taskId: String(startResult.task_id) });
+      }
       window.location.href = taskPathFromCreate(startResult);
     } catch (error) {
       console.error("Error processing video:", error);
@@ -1069,7 +1110,8 @@ export default function HomeApp() {
             {t(`subtitleByWorkflow.${activeWorkflow}`)}
           </p>
 
-          {upgradeState && billingSummary && (billingTeamId
+          {/* While the first clip is free, Agent offers the plans when it's ready; no upsell here. */}
+          {upgradeState && billingSummary && !preview?.active && (billingTeamId
             ? <TeamStatusNudge state={upgradeState} billing={billingSummary} teamRole={teamRole} />
             : <PlanStatusNudge state={upgradeState} onUpgrade={openUpgrade} />)}
 
@@ -1535,6 +1577,7 @@ export default function HomeApp() {
                 <Button
                   type="submit"
                   size="icon"
+                  data-tour="composer-generate"
                   aria-label={t(`generateByWorkflow.${activeWorkflow}`)}
                   disabled={!hasSource || isLoading || lengthLoading || awaitingWorkflows || awaitingEditStyles || topicProblem !== null || instructionsTooLong || advancedProblem !== null}
                   className="size-9 rounded-full bg-brand text-brand-foreground shadow-sm hover:bg-brand/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100"
@@ -1544,6 +1587,28 @@ export default function HomeApp() {
               </div>
             </div>
           </form>
+
+          {agentLink && (
+            <p className="mt-3 text-center text-xs text-muted-foreground">
+              <Link href={agentLink} className="inline-flex items-center gap-1 underline-offset-2 hover:text-foreground hover:underline">
+                <PebbleIcon className="size-3.5" />{t("askAgentInstead")}
+              </Link>
+            </p>
+          )}
+          {agentLocked && (
+            <p className="mt-3 flex flex-wrap items-center justify-center gap-x-1.5 gap-y-1 text-center text-xs text-muted-foreground">
+              {agentLocked.lapsed && <span>{t(agentLocked.reason === "trial_used" ? "agentTrialEnded" : "agentLapsed")}</span>}
+              <button
+                type="button"
+                onClick={() => openUpgrade({ kind: "agent", trialUsed: agentLocked.reason === "trial_used" })}
+                className="group inline-flex items-center gap-1.5 underline-offset-2 hover:text-foreground"
+              >
+                <PebbleIcon className="size-3.5" />
+                <span className="group-hover:underline">{t(agentLocked.lapsed ? "agentBackWithCreator" : "askAgentInstead")}</span>
+                <span className="rounded-full border border-brand/25 bg-brand/5 px-1.5 py-px text-[10px] font-medium leading-4 text-brand">{t("creatorTag")}</span>
+              </button>
+            </p>
+          )}
 
           {isLoading && statusMessage && <p role="status" className="mt-3 text-center text-sm text-muted-foreground sm:hidden">{statusMessage}</p>}
 

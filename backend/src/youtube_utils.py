@@ -116,7 +116,7 @@ class YouTubeDownloader:
 
 def get_cookiefile() -> Optional[str]:
     cookie_path = os.getenv("YOUTUBE_COOKIES_PATH", "/app/cookies.txt")
-    if os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 0:
+    if os.path.isfile(cookie_path) and os.path.getsize(cookie_path) > 0:
         return cookie_path
     return None
 

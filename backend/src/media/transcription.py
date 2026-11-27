@@ -680,7 +680,7 @@ def transcribe_with_youtube_captions(video_url: str) -> Optional[str]:
             "outtmpl": str(temp_dir / video_id),
         }
         cookie_path = os.getenv("YOUTUBE_COOKIES_PATH", "/app/cookies.txt")
-        if os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 0:
+        if os.path.isfile(cookie_path) and os.path.getsize(cookie_path) > 0:
             ydl_opts["cookiefile"] = cookie_path
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])

@@ -64,6 +64,8 @@ def build_agent(output_type: type[T], system_prompt: str, *, structural: bool) -
         cfg.openrouter_fallback_model,
         cfg.google_api_key,
         cfg.anthropic_api_key,
+        getattr(cfg, "bedrock_api_key", None),
+        getattr(cfg, "aws_region", None),
         cfg.ollama_base_url,
         cfg.ollama_api_key,
     )
